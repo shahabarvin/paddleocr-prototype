@@ -24,6 +24,16 @@ Open <http://127.0.0.1:8000>, upload a JPG/PNG/PDF.
   MX450 2 GB is too small for the server models).
 - `OCR_UNWARP=1` enables document unwarping (useful for phone photos of
   curved pages; off by default).
+- `OCR_HOST=0.0.0.0 OCR_PORT=8000` to reach the app from outside the machine
+  (e.g. when testing on a server). No auth — don't leave it exposed.
+
+Linux server quick-start:
+
+```bash
+git clone https://github.com/shahabarvin/paddleocr-prototype && cd paddleocr-prototype
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+OCR_HOST=0.0.0.0 .venv/bin/python app.py
+```
 
 ## What you get per upload
 
@@ -62,10 +72,10 @@ Both pipelines stay cached in memory after first use, so switching is free.
 
 Two caveats that make this a *worst-case* number:
 
-1. **oneDNN is disabled** (`enable_mkldnn=False` in `app.py`) to work around a
-   paddlepaddle 3.3 bug on Windows CPU that crashes the RT-DETR-based layout
-   model. On Linux (where the production API would run) oneDNN works and CPU
-   inference is several times faster.
+1. **oneDNN is disabled on Windows only** to work around a paddlepaddle 3.3
+   bug that crashes the RT-DETR-based layout model on Windows CPU. On Linux
+   it stays enabled automatically and CPU inference is several times faster
+   (override with `OCR_MKLDNN=0/1`).
 2. These are the largest server-grade models on laptop CPU. On a GPU server
    the same pipeline typically runs 1–3 s/page. The local MX450 (2 GB) is too
    small to try.

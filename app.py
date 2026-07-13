@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
 import time
 import uuid
@@ -66,14 +67,17 @@ class OCRService:
         names fall through to the next attempt (paddleocr minor versions
         differ in what they accept).
 
-        enable_mkldnn=False works around a paddlepaddle 3.x bug on Windows
-        CPU: the oneDNN executor fails on the RT-DETR-based layout model
+        oneDNN is disabled on Windows only: a paddlepaddle 3.x bug makes
+        its executor fail on the RT-DETR-based layout model
         ("ConvertPirAttribute2RuntimeAttribute not support
-        pir::ArrayAttribute").
+        pir::ArrayAttribute"). On Linux it works and is a several-fold
+        CPU speedup, so it stays on. Override with OCR_MKLDNN=0/1.
         """
+        mkldnn_default = "0" if sys.platform == "win32" else "1"
+        mkldnn = os.environ.get("OCR_MKLDNN", mkldnn_default) == "1"
         common = dict(
             device=self.device,
-            enable_mkldnn=False,
+            enable_mkldnn=mkldnn,
             cpu_threads=os.cpu_count() or 8,
             use_doc_orientation_classify=True,
             use_doc_unwarping=os.environ.get("OCR_UNWARP", "0") == "1",
@@ -88,8 +92,8 @@ class OCRService:
             )
             return [
                 {**common, **names},
-                {"device": self.device, "enable_mkldnn": False, **names},
-                {"device": self.device, "enable_mkldnn": False},
+                {"device": self.device, "enable_mkldnn": mkldnn, **names},
+                {"device": self.device, "enable_mkldnn": mkldnn},
                 {"device": self.device},
                 {},
             ]
@@ -120,7 +124,7 @@ class OCRService:
              "use_table_recognition": False,
              "layout_detection_model_name": "PP-DocLayout-S"},
             {**common, **names},
-            {"device": self.device, "enable_mkldnn": False, **names},
+            {"device": self.device, "enable_mkldnn": mkldnn, **names},
         ]
 
     def load(self, tier: str = "server") -> float:
@@ -670,6 +674,8 @@ document.querySelectorAll(".tabs button").forEach(btn => btn.onclick = () => {
 
 if __name__ == "__main__":
     import uvicorn
-    print("Starting PaddleOCR prototype at http://127.0.0.1:8000")
+    host = os.environ.get("OCR_HOST", "127.0.0.1")  # 0.0.0.0 for remote access
+    port = int(os.environ.get("OCR_PORT", "8000"))
+    print(f"Starting PaddleOCR prototype at http://{host}:{port}")
     print("(first ever start downloads the models -- watch the console)")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host=host, port=port)
