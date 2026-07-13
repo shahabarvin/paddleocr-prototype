@@ -1,0 +1,10 @@
+# local environment
+.venv/
+__pycache__/
+*.pyc
+
+# OCR job outputs (contain uploaded test documents — keep out of the repo)
+output/
+
+# local tooling
+.claude/

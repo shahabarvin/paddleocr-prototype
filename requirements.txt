@@ -1,0 +1,7 @@
+# Python 3.12 recommended (PaddlePaddle has no wheels for 3.14 yet)
+paddlepaddle>=3.0.0
+# [doc-parser] extra is required for the PP-StructureV3 layout pipeline
+paddleocr[doc-parser]>=3.1.0
+fastapi
+uvicorn
+python-multipart
