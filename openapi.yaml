@@ -1,0 +1,442 @@
+openapi: 3.0.3
+info:
+  title: PaddleOCR OCR Service
+  version: "1.0.0"
+  description: |
+    Seat-limited, deduplicated, **asynchronous** OCR (PaddleOCR PP-StructureV3).
+    You submit a document, get a `process_id` immediately, then poll for the
+    result. This description is the full integration guide; the paths and schemas
+    below are the exact contract.
+
+    ## Auth
+    Every `/api/*` and `/files/*` call needs `Authorization: Bearer <token>`.
+    Store the token in config/env (e.g. `config('services.ocr.token')`) — never
+    hardcode or log it. Tokens are issued/revoked server-side (keys.py); a request
+    without a valid token gets `401`. `GET /healthz` is public. Interactive docs
+    with a Try-it-out tester are at `GET /docs` (Swagger UI).
+    Base URL: `https://ocr.voiceaccountant.com`.
+
+    ## Core flow — submit then poll
+    1. `POST /api/ocr` (multipart) with a stable `key`. Immediate response:
+       - `202 {status:"started"}` — admitted, now processing
+       - `202 {status:"in_progress"}` — same `key` already running
+       - `200 {status:"done", result}` — same `key` already finished (cached)
+       - `429 {status:"no_seat"}` + `Retry-After` — all seats busy, back off
+    2. `GET /api/ocr/{process_id}` — poll until `status` is `done` (has `result`)
+       or `failed` (has `error`). `202` with `queued`/`processing` = keep polling.
+
+    ## Idempotency (important for the queue)
+    Pass your own stable id as `key` (the Laravel document id or job uuid).
+    Re-submitting the same `key` never starts a second OCR — it returns the
+    existing job / cached result, so **Laravel job retries are safe**. If `key`
+    is omitted, the id is `sha256(file + options)`.
+
+    ## Handle 429 no_seat
+    At most **3** jobs run at once. On `429`, back off and retry — don't hammer.
+    In a queued job: `return $this->release(now()->addSeconds(2));`
+
+    ## Queue tuning
+    - Queue worker concurrency ~ **3** (the seat count). More just get 429s; the
+      GPU is the ceiling (~2-3 img/s).
+    - Job `timeout`/`retry_after` **> 120 s** so a slow job isn't retried while it
+      is still running.
+
+    ## Request options
+    - `model`: `server` (default, best quality) or `mobile` (faster, no table/
+      formula structure).
+    - `enhance`: `1` for scans/photos/receipts (denoise+contrast, ~40% slower),
+      `0` for clean digital PDFs.
+    - `overlays`: keep `0` in production (`1` only saves debug overlay PNGs).
+
+    ## Using the result
+    - `result.markdown` — layout-aware markdown; the main text to feed your LLM.
+    - `result.layout_text` — plain text preserving columns/line-breaks; better for
+      receipts / forms / tickets.
+
+    ## Status / error cheatsheet
+    - `401` — missing/invalid/revoked token.
+    - `429` — all seats busy -> back off + retry.
+    - `503` — warming up or model-load error -> retry shortly.
+    - `404` on GET — unknown/expired `process_id` (results kept ~1 h) -> re-submit.
+    - `failed` status — OCR error (`error` field); safe to retry with same `key`.
+
+    ## Example — a Laravel job
+    ```php
+    $ocr = fn () => Http::withToken(config('services.ocr.token'))
+        ->baseUrl(config('services.ocr.url'));   // https://ocr.voiceaccountant.com
+
+    $res = $ocr()->attach('file', $bytes, 'doc.png')->post('/api/ocr', [
+        'key'     => (string) $this->documentId,   // stable idempotency key
+        'model'   => 'server',
+        'enhance' => $this->isScan ? '1' : '0',
+    ]);
+    if ($res->status() === 429) {
+        return $this->release(now()->addSeconds(2));   // no seat -> requeue
+    }
+    $id = $res->json('process_id');
+
+    do {
+        usleep(300000); // 0.3s
+        $job = $ocr()->get("/api/ocr/{$id}")->json();
+    } while (in_array($job['status'], ['started','in_progress','queued','processing']));
+
+    if ($job['status'] === 'failed') {
+        throw new \RuntimeException($job['error'] ?? 'OCR failed');
+    }
+    $markdown = $job['result']['markdown'] ?? '';
+    ```
+servers:
+  - url: https://ocr.voiceaccountant.com
+    description: Production (Cloudflare Tunnel)
+  - url: http://127.0.0.1:8000
+    description: Local (default bind)
+security:
+  - bearerAuth: []
+
+paths:
+  /api/ocr:
+    post:
+      operationId: submitOcr
+      summary: Submit a document for OCR (async, seat-limited, idempotent)
+      description: >
+        Admits the job if a seat is free and returns `started`; returns
+        `in_progress` if the same `key` is already running, `done` (with the
+        cached result) if it already finished, or `no_seat` (HTTP 429) if all
+        seats are busy. Then poll `GET /api/ocr/{process_id}` for the result.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: "Image or PDF. Allowed extensions: jpg, jpeg, png, pdf, bmp, webp. Max 20 MB (413 if larger)."
+                key:
+                  type: string
+                  description: >
+                    Idempotency key — pass your Laravel job/document id. Omit to
+                    derive it from sha256(file bytes + options). Max 64 chars;
+                    characters outside [A-Za-z0-9_.-] are replaced with '_'.
+                  example: "invoice-4f3a9b"
+                model:
+                  type: string
+                  enum: [server, mobile]
+                  default: server
+                  description: Quality tier (`server`) or fast tier (`mobile`, no table/formula structure).
+                device:
+                  type: string
+                  enum: [gpu, cpu]
+                  description: Compute device. Defaults to the server's default (gpu); a gpu request falls back to cpu if unavailable.
+                enhance:
+                  type: string
+                  enum: ["0", "1"]
+                  default: "0"
+                  description: "1 = denoise + contrast pre-pass for faded/low-contrast scans (images only). Slower (~40%)."
+                overlays:
+                  type: string
+                  enum: ["0", "1"]
+                  default: "0"
+                  description: "1 = also save detection overlay PNGs (retrievable via /files/...)."
+      responses:
+        "202":
+          description: Accepted. The job was admitted (`started`) or is already running (`in_progress`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitAccepted"
+              examples:
+                started:
+                  value: { status: started, process_id: "invoice-4f3a9b" }
+                in_progress:
+                  value: { status: in_progress, process_id: "invoice-4f3a9b" }
+        "200":
+          description: The job with this `key` already finished; the cached result is returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobDone"
+        "429":
+          description: All seats busy. Back off and retry.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoSeat"
+              example: { status: no_seat, process_id: "invoice-4f3a9b" }
+        "400":
+          description: Unsupported file type, unknown model tier, or unknown device.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "413":
+          description: File exceeds the max upload size (default 20 MB, OCR_MAX_UPLOAD_MB).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Models still warming up, or model load failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/ocr/{process_id}:
+    get:
+      operationId: getOcrJob
+      summary: Retrieve a job's status and result by process_id
+      parameters:
+        - name: process_id
+          in: path
+          required: true
+          schema: { type: string }
+          example: "invoice-4f3a9b"
+      responses:
+        "200":
+          description: Job finished (`done` with `result`, or `failed` with `error`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobRecord"
+              examples:
+                done:
+                  value:
+                    process_id: "invoice-4f3a9b"
+                    status: done
+                    worker: "16584"
+                    created_at: 1721312400.12
+                    updated_at: 1721312400.71
+                    result:
+                      markdown: "## Tim Hortons\n\n..."
+                      layout_text: "Tim Hortons  #104236\n..."
+                      model_tier: server
+                      device: gpu
+                      enhanced: true
+                failed:
+                  value:
+                    process_id: "invoice-4f3a9b"
+                    status: failed
+                    worker: "16584"
+                    error: "RuntimeError: OCR failed"
+        "202":
+          description: Job still queued or processing; no result yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobRecord"
+              example: { process_id: "invoice-4f3a9b", status: processing, worker: "16584" }
+        "404":
+          description: Unknown process_id (never submitted, or purged after TTL).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/status:
+    get:
+      operationId: getStatus
+      summary: Service and seat-usage status (of the responding worker)
+      responses:
+        "200":
+          description: Current state.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatusResponse" }
+              example:
+                state: ready
+                error: null
+                worker: "16584"
+                device: gpu
+                gpu_available: true
+                seats: 3
+                in_flight: 1
+                available: 2
+                by_status: { done: 42, processing: 1 }
+
+  /files/{process_id}/{path}:
+    get:
+      operationId: getFile
+      summary: Fetch a saved artifact (e.g. an overlay PNG) for a job
+      parameters:
+        - name: process_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: path
+          in: path
+          required: true
+          schema: { type: string }
+          example: "viz/input_overall_ocr_res.png"
+      responses:
+        "200":
+          description: The file.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404":
+          description: Not found.
+
+  /openapi.yaml:
+    get:
+      operationId: openapiSpec
+      summary: This OpenAPI spec (public, no auth)
+      security: []
+      responses:
+        "200":
+          description: The spec document.
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /healthz:
+    get:
+      operationId: healthz
+      summary: Public liveness probe (no auth)
+      security: []
+      responses:
+        "200":
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  ready: { type: boolean }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "Send Authorization: Bearer <token>. Tokens are managed with keys.py on the server."
+  schemas:
+    SubmitAccepted:
+      type: object
+      required: [status, process_id]
+      properties:
+        status:
+          type: string
+          enum: [started, in_progress]
+        process_id: { type: string }
+
+    NoSeat:
+      type: object
+      required: [status, process_id]
+      properties:
+        status: { type: string, enum: [no_seat] }
+        process_id: { type: string }
+
+    JobDone:
+      type: object
+      required: [status, process_id, result]
+      properties:
+        status: { type: string, enum: [done] }
+        process_id: { type: string }
+        result: { $ref: "#/components/schemas/OcrResult" }
+
+    JobRecord:
+      type: object
+      description: Full job record from GET /api/ocr/{process_id}.
+      required: [process_id, status]
+      properties:
+        process_id: { type: string }
+        status:
+          type: string
+          enum: [queued, processing, done, failed]
+        worker: { type: string, nullable: true, description: PID of the worker that (last) handled it. }
+        created_at: { type: number, description: Unix epoch seconds. }
+        updated_at: { type: number, description: Unix epoch seconds. }
+        result:
+          allOf: [ { $ref: "#/components/schemas/OcrResult" } ]
+          nullable: true
+          description: Present when status is `done`.
+        error:
+          type: string
+          nullable: true
+          description: Present when status is `failed`.
+
+    OcrResult:
+      type: object
+      description: The OCR output for one document.
+      properties:
+        pages: { type: integer, description: Number of pages processed. }
+        markdown:
+          type: string
+          description: Layout-aware markdown (headings, reading order, tables). The primary LLM-input text.
+        layout_text:
+          type: string
+          description: Plain text on a monospace grid, preserving line breaks and column alignment.
+        model_tier: { type: string, enum: [server, mobile] }
+        device: { type: string, enum: [gpu, cpu], description: Device actually used (after any fallback). }
+        device_note:
+          type: string
+          nullable: true
+          description: Set when a gpu request fell back to cpu.
+        enhanced: { type: boolean, description: Whether the enhance pre-pass was applied. }
+        timings: { $ref: "#/components/schemas/Timings" }
+        visualizations:
+          type: array
+          items: { $ref: "#/components/schemas/Visualization" }
+        process_id: { type: string }
+        worker: { type: string }
+      example:
+        pages: 1
+        markdown: "## Tim Hortons\n\n..."
+        layout_text: "Tim Hortons  #104236\n..."
+        model_tier: server
+        device: gpu
+        device_note: null
+        enhanced: true
+        timings:
+          model_load_seconds: 8.8
+          model_loaded_during_request: false
+          model_load_included_download: false
+          inference_seconds: 0.58
+          postprocess_seconds: 0.34
+          server_total_seconds: 0.95
+        visualizations:
+          - { name: "input_overall_ocr_res.png", url: "/files/invoice-4f3a9b/viz/input_overall_ocr_res.png" }
+        process_id: "invoice-4f3a9b"
+        worker: "16584"
+
+    Timings:
+      type: object
+      properties:
+        model_load_seconds: { type: number }
+        model_loaded_during_request: { type: boolean }
+        model_load_included_download: { type: boolean }
+        inference_seconds: { type: number }
+        postprocess_seconds: { type: number }
+        server_total_seconds: { type: number }
+
+    Visualization:
+      type: object
+      properties:
+        name: { type: string }
+        url: { type: string, description: Path under this service to fetch the overlay image. }
+
+    StatusResponse:
+      type: object
+      properties:
+        state: { type: string, enum: [loading, ready, error] }
+        error: { type: string, nullable: true }
+        worker: { type: string, description: PID of the responding worker. }
+        device: { type: string, enum: [gpu, cpu] }
+        gpu_available: { type: boolean }
+        seats: { type: integer }
+        in_flight: { type: integer, description: Jobs currently queued + processing. }
+        available: { type: integer, description: Free seats (seats - in_flight). }
+        by_status:
+          type: object
+          additionalProperties: { type: integer }
+          description: Row counts by status across the shared store.
+
+    Error:
+      type: object
+      properties:
+        detail: { type: string }

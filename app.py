@@ -47,36 +47,85 @@ class OCRService:
     TIERS = ("server", "mobile")
 
     def __init__(self, device: Optional[str] = None):
-        self.device = device or os.environ.get("OCR_DEVICE", "cpu")
-        self._pipelines: dict[str, Any] = {}
-        self._load_meta: dict[str, dict] = {}  # tier -> load stats
+        # Preferred device for the default (unspecified) request. GPU by
+        # default; a request may override per-call, and any gpu request
+        # transparently falls back to cpu when no CUDA build is present.
+        self.default_device = self._normalize_device(
+            device or os.environ.get("OCR_DEVICE", "gpu")
+        )
+        # Pipelines are cached per (tier, device): the same tier can be held
+        # loaded on both gpu and cpu at once, so switching is free after warmup.
+        self._pipelines: dict[tuple[str, str], Any] = {}
+        self._load_meta: dict[tuple[str, str], dict] = {}  # (tier, device) -> stats
         self._load_lock = threading.Lock()
         self._predict_lock = threading.Lock()  # pipelines are not thread-safe
         self.load_error: Optional[str] = None
 
+    # -- device selection --------------------------------------------------
+
+    VALID_DEVICES = ("gpu", "cpu")
+
+    @classmethod
+    def _normalize_device(cls, device: Optional[str]) -> str:
+        """Fold user/env input into 'gpu' or 'cpu' (unset/'auto' -> 'gpu')."""
+        d = (device or "").strip().lower()
+        if d in ("", "auto", "cuda", "gpu:0"):
+            return "gpu" if d != "cpu" else "cpu"
+        if d.startswith("gpu") or d == "cpu":
+            return "gpu" if d.startswith("gpu") else "cpu"
+        return "cpu"
+
+    @staticmethod
+    def gpu_available() -> bool:
+        """True only if PaddlePaddle is a CUDA build with a visible device."""
+        try:
+            import paddle
+            return (paddle.device.is_compiled_with_cuda()
+                    and paddle.device.cuda.device_count() > 0)
+        except Exception:
+            return False
+
+    def _resolve_device(self, device: Optional[str]) -> tuple[str, Optional[str]]:
+        """Map a requested device to one we can actually run on.
+
+        Returns (effective_device, note). A gpu request on a machine with no
+        CUDA-enabled PaddlePaddle silently falls back to cpu; the note is
+        surfaced through the API so the UI can show what really happened.
+        """
+        want = self._normalize_device(
+            device if device is not None else self.default_device
+        )
+        if want == "gpu" and not self.gpu_available():
+            return "cpu", ("GPU requested but unavailable — PaddlePaddle is a "
+                           "CPU-only build or no CUDA device is present; running "
+                           "on CPU. Install paddlepaddle-gpu to enable GPU.")
+        return want, None
+
     # -- loading -----------------------------------------------------------
 
-    def is_loaded(self, tier: str = "server") -> bool:
-        return tier in self._pipelines
+    def is_loaded(self, tier: str = "server", device: Optional[str] = None) -> bool:
+        eff, _ = self._resolve_device(device)
+        return (tier, eff) in self._pipelines
 
     def load_meta(self) -> dict:
         return self._load_meta
 
-    def _kwarg_attempts(self, tier: str) -> list[dict]:
+    def _kwarg_attempts(self, tier: str, device: str) -> list[dict]:
         """Constructor kwargs, best config first; unknown kwargs or model
         names fall through to the next attempt (paddleocr minor versions
         differ in what they accept).
 
-        oneDNN is disabled on Windows only: a paddlepaddle 3.x bug makes
-        its executor fail on the RT-DETR-based layout model
-        ("ConvertPirAttribute2RuntimeAttribute not support
-        pir::ArrayAttribute"). On Linux it works and is a several-fold
-        CPU speedup, so it stays on. Override with OCR_MKLDNN=0/1.
+        oneDNN (a CPU-only optimization) is disabled on Windows and whenever
+        the device is gpu: a paddlepaddle 3.x bug makes its executor fail on
+        the RT-DETR-based layout model ("ConvertPirAttribute2RuntimeAttribute
+        not support pir::ArrayAttribute"). On Linux CPU it works and is a
+        several-fold speedup, so it stays on there. Override with OCR_MKLDNN=0/1.
         """
         mkldnn_default = "0" if sys.platform == "win32" else "1"
-        mkldnn = os.environ.get("OCR_MKLDNN", mkldnn_default) == "1"
+        mkldnn = (os.environ.get("OCR_MKLDNN", mkldnn_default) == "1"
+                  and device != "gpu")
         common = dict(
-            device=self.device,
+            device=device,
             enable_mkldnn=mkldnn,
             cpu_threads=os.cpu_count() or 8,
             use_doc_orientation_classify=True,
@@ -92,9 +141,9 @@ class OCRService:
             )
             return [
                 {**common, **names},
-                {"device": self.device, "enable_mkldnn": mkldnn, **names},
-                {"device": self.device, "enable_mkldnn": mkldnn},
-                {"device": self.device},
+                {"device": device, "enable_mkldnn": mkldnn, **names},
+                {"device": device, "enable_mkldnn": mkldnn},
+                {"device": device},
                 {},
             ]
         # Fast profile: mobile det/rec, small layout model, and formula/seal
@@ -124,16 +173,19 @@ class OCRService:
              "use_table_recognition": False,
              "layout_detection_model_name": "PP-DocLayout-S"},
             {**common, **names},
-            {"device": self.device, "enable_mkldnn": mkldnn, **names},
+            {"device": device, "enable_mkldnn": mkldnn, **names},
         ]
 
-    def load(self, tier: str = "server") -> float:
-        """Build the pipeline for a tier. Idempotent; returns load seconds."""
+    def load(self, tier: str = "server", device: Optional[str] = None) -> float:
+        """Build the pipeline for a (tier, device). Idempotent; returns load
+        seconds. A gpu request with no CUDA build loads on cpu instead."""
         if tier not in self.TIERS:
             raise ValueError(f"Unknown model tier: {tier!r}")
+        eff, note = self._resolve_device(device)
+        key = (tier, eff)
         with self._load_lock:
-            if tier in self._pipelines:
-                return self._load_meta[tier]["load_seconds"]
+            if key in self._pipelines:
+                return self._load_meta[key]["load_seconds"]
 
             cache_populated = MODELS_CACHE_DIR.is_dir() and any(
                 MODELS_CACHE_DIR.iterdir()
@@ -144,7 +196,7 @@ class OCRService:
             t0 = time.perf_counter()
             pipeline = None
             last_err: Optional[Exception] = None
-            for kwargs in self._kwarg_attempts(tier):
+            for kwargs in self._kwarg_attempts(tier, eff):
                 try:
                     pipeline = PPStructureV3(**kwargs)
                     break
@@ -156,10 +208,12 @@ class OCRService:
                 raise RuntimeError(f"Failed to build PPStructureV3: {last_err}")
 
             load_seconds = round(time.perf_counter() - t0, 3)
-            self._pipelines[tier] = pipeline
-            self._load_meta[tier] = {
+            self._pipelines[key] = pipeline
+            self._load_meta[key] = {
                 "load_seconds": load_seconds,
                 "included_download": not cache_populated,
+                "device": eff,
+                "device_note": note,
             }
             return load_seconds
 
@@ -170,19 +224,38 @@ class OCRService:
         input_path: str | Path,
         viz_dir: Optional[str | Path] = None,
         tier: str = "server",
+        device: Optional[str] = None,
+        enhance: bool = False,
     ) -> dict[str, Any]:
         """Run PP-StructureV3 on one image/PDF file.
 
-        Returns dict with keys: markdown, layout_text, pages, timings,
-        visualizations.
+        ``enhance`` runs a contrast/denoise pre-pass (see ``_enhance_image``)
+        for faded or noisy images; ignored for PDFs. Returns dict with keys:
+        markdown, layout_text, pages, timings, device, enhanced, visualizations.
         """
-        loaded_before = self.is_loaded(tier)
-        load_seconds = self.load(tier)  # no-op if already loaded
-        pipeline = self._pipelines[tier]
+        eff, note = self._resolve_device(device)
+        loaded_before = (tier, eff) in self._pipelines
+        load_seconds = self.load(tier, device)  # no-op if already loaded
+        pipeline = self._pipelines[(tier, eff)]
+
+        # Optional pre-processing: enhance faded/noisy images and feed the
+        # cleaned pixels (ndarray) to the pipeline instead of the raw file.
+        predict_input: Any = str(input_path)
+        enhanced_applied = False
+        if enhance and Path(input_path).suffix.lower() != ".pdf":
+            import cv2
+            raw = cv2.imread(str(input_path))
+            if raw is not None:
+                enhanced = self._enhance_image(raw)
+                predict_input = enhanced
+                enhanced_applied = True
+                if viz_dir is not None:
+                    Path(viz_dir).mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(Path(viz_dir) / "00_input_enhanced.png"), enhanced)
 
         t0 = time.perf_counter()
         with self._predict_lock:
-            outputs = list(pipeline.predict(str(input_path)))
+            outputs = list(pipeline.predict(predict_input))
         inference_seconds = round(time.perf_counter() - t0, 3)
 
         t1 = time.perf_counter()
@@ -198,11 +271,14 @@ class OCRService:
             "markdown": markdown,
             "layout_text": layout_text,
             "model_tier": tier,
+            "device": eff,
+            "device_note": note,
+            "enhanced": enhanced_applied,
             "timings": {
                 "model_load_seconds": load_seconds,
                 "model_loaded_during_request": not loaded_before,
                 "model_load_included_download":
-                    self._load_meta[tier]["included_download"],
+                    self._load_meta[(tier, eff)]["included_download"],
                 "inference_seconds": inference_seconds,
                 "postprocess_seconds": postprocess_seconds,
             },
@@ -221,10 +297,29 @@ class OCRService:
         s = text.strip()
         return len(s) >= 3 and s != "---" and not cls._ALNUM_RE.search(s)
 
+    @staticmethod
+    def _normalize_fullwidth(text: str) -> str:
+        """Fold full-width ASCII (U+FF01-FF5E) and the ideographic space to
+        their half-width forms. The rec model occasionally emits e.g. a
+        full-width colon ('Receipt #：') on CJK-trained glyphs; this is a
+        lossless, purely typographic fix that never invents content."""
+        out = []
+        for ch in text:
+            o = ord(ch)
+            if 0xFF01 <= o <= 0xFF5E:
+                out.append(chr(o - 0xFEE0))
+            elif o == 0x3000:
+                out.append(" ")
+            else:
+                out.append(ch)
+        return "".join(out)
+
     @classmethod
     def _strip_noise_lines(cls, text: str) -> str:
-        """Drop lines with content but no letter/digit in any script
-        (separator fragments); keep blank lines and '---' page breaks."""
+        """Normalize full-width punctuation, then drop lines with content but
+        no letter/digit in any script (separator fragments); keep blank lines
+        and '---' page breaks."""
+        text = cls._normalize_fullwidth(text)
         return "\n".join(
             line for line in text.splitlines()
             if not line.strip() or line.strip() == "---"
@@ -350,6 +445,36 @@ class OCRService:
             if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
         )
 
+    @staticmethod
+    def _enhance_image(bgr, binarize: bool = False):
+        """Rescue faded / low-contrast / noisy captures (thermal receipts,
+        crumpled or smudged paper) *before* OCR.
+
+        Pipeline: grayscale -> edge-preserving denoise (kills fingerprint and
+        paper speckle) -> CLAHE local contrast (the big lever for faded thermal
+        print) -> upscale small images so thin strokes survive detection.
+
+        Deep recognition models generally read grayscale-contrast better than
+        hard black/white, so adaptive binarization is opt-in (``binarize``) for
+        only the faintest documents. Returns a 3-channel BGR ndarray.
+        """
+        import cv2
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.fastNlMeansDenoising(
+            gray, None, h=10, templateWindowSize=7, searchWindowSize=21
+        )
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        h, w = gray.shape[:2]
+        if max(h, w) < 1800:  # upscale small phone captures
+            gray = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+        if binarize:
+            gray = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 31, 15,
+            )
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
 
 # --------------------------------------------------------------------------
 # Web layer (FastAPI) -- prototype-only; the future API replaces this part
@@ -383,14 +508,19 @@ def _startup() -> None:
 @app.get("/api/status")
 def status() -> dict:
     meta = service.load_meta()
-    server_meta = meta.get("server", {})
+    server_meta = next(
+        (m for (tier, _dev), m in meta.items() if tier == "server"), {}
+    )
     return {
         "state": _load_state["state"],
         "error": _load_state["error"],
         "model_load_seconds": server_meta.get("load_seconds"),
         "model_load_included_download": server_meta.get("included_download"),
-        "tiers_loaded": sorted(meta.keys()),
-        "device": service.device,
+        "tiers_loaded": sorted(f"{t}:{d}" for (t, d) in meta.keys()),
+        "device": server_meta.get("device", service.default_device),
+        "default_device": service.default_device,
+        "gpu_available": service.gpu_available(),
+        "device_note": server_meta.get("device_note"),
     }
 
 
@@ -398,7 +528,9 @@ def status() -> dict:
 def run_ocr(
     file: UploadFile = File(...),
     model: str = Form("server"),
+    device: str = Form(""),
     overlays: str = Form("1"),
+    enhance: str = Form("0"),
 ) -> JSONResponse:
     ext = Path(file.filename or "upload").suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -407,6 +539,9 @@ def run_ocr(
     if model not in OCRService.TIERS:
         raise HTTPException(400, f"Unknown model tier '{model}'. "
                                  f"Allowed: {list(OCRService.TIERS)}")
+    if device and device.strip().lower() not in ("gpu", "cpu", "auto"):
+        raise HTTPException(400, f"Unknown device '{device}'. "
+                                 f"Allowed: {list(OCRService.VALID_DEVICES)}")
     if _load_state["state"] == "error":
         raise HTTPException(503, f"Model failed to load: {_load_state['error']}")
 
@@ -419,7 +554,10 @@ def run_ocr(
     t0 = time.perf_counter()
     try:
         viz_dir = (job_dir / "viz") if overlays == "1" else None
-        result = service.process(input_path, viz_dir=viz_dir, tier=model)
+        result = service.process(
+            input_path, viz_dir=viz_dir, tier=model, device=(device or None),
+            enhance=(enhance == "1"),
+        )
     except Exception as err:
         raise HTTPException(500, f"OCR failed: {type(err).__name__}: {err}")
     result["timings"]["server_total_seconds"] = round(time.perf_counter() - t0, 3)
@@ -529,8 +667,16 @@ INDEX_HTML = r"""<!doctype html>
       <option value="server">Quality — server models (slow on CPU)</option>
       <option value="mobile">Fast — mobile models, no table/formula structure</option>
     </select>
+    <select id="device" title="Compute device">
+      <option value="gpu">GPU</option>
+      <option value="cpu">CPU</option>
+    </select>
     <label style="font-size:13px;color:#8b98a5;cursor:pointer">
       <input type="checkbox" id="viz" checked> overlays
+    </label>
+    <label style="font-size:13px;color:#8b98a5;cursor:pointer"
+           title="Denoise + contrast pre-pass for faded/crumpled/low-contrast scans (images only)">
+      <input type="checkbox" id="enhance"> enhance
     </label>
     <button id="run" disabled>Run OCR</button>
     <span id="runTimer" class="sub" style="margin:0"></span>
@@ -579,7 +725,11 @@ async function poll() {
       $("status").textContent = "models ready";
       $("loadInfo").textContent =
         `load took ${fmt(s.model_load_seconds)} on ${s.device}` +
-        (s.model_load_included_download ? " (first run: includes model download)" : "");
+        (s.model_load_included_download ? " (first run: includes model download)" : "") +
+        (s.device_note ? " — " + s.device_note : "");
+      // Reflect actual availability: if GPU isn't usable, preselect CPU so the
+      // dropdown doesn't imply a GPU run that will silently fall back.
+      if (!s.gpu_available) $("device").value = "cpu";
       $("run").disabled = false;
       return;
     }
@@ -612,7 +762,9 @@ $("run").onclick = async () => {
   const fd = new FormData();
   fd.append("file", f);
   fd.append("model", $("tier").value);
+  fd.append("device", $("device").value);
   fd.append("overlays", $("viz").checked ? "1" : "0");
+  fd.append("enhance", $("enhance").checked ? "1" : "0");
   try {
     const resp = await fetch("/api/ocr", { method: "POST", body: fd });
     const roundTrip = (Date.now() - t0) / 1000;
@@ -638,6 +790,8 @@ function render(r, roundTrip) {
   const t = r.timings;
   $("chips").innerHTML =
     chip("Models", r.model_tier === "mobile" ? "fast (mobile)" : "quality (server)") +
+    chip("Device", (r.device || "cpu").toUpperCase(), r.device_note ? "fell back from GPU" : "") +
+    (r.enhanced ? chip("Pre-processing", "enhanced", "denoise + contrast") : "") +
     chip("Inference", fmt(t.inference_seconds), r.pages + " page(s)") +
     chip("Post-processing", fmt(t.postprocess_seconds), "markdown + overlays") +
     chip("Server total", fmt(t.server_total_seconds)) +

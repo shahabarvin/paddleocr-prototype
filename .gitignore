@@ -6,5 +6,22 @@ __pycache__/
 # OCR job outputs (contain uploaded test documents — keep out of the repo)
 output/
 
+# local test images (may contain personal receipts — keep out of the repo)
+samples/
+
 # local tooling
 .claude/
+
+# transient run logs
+*.log
+
+# shared-state DB for the multi-worker service (runtime)
+state.db
+state.db-wal
+state.db-shm
+
+# API bearer keys (hashes, but keep out of the repo)
+api_keys.json
+
+# DNS migration snapshots (may contain infra detail)
+dns_snapshot*.txt
