@@ -49,6 +49,7 @@ def create(label: str) -> None:
     print(f"  label  : {label}")
     print(f"  token  : {token}\n")
     print("Use it as:  Authorization: Bearer " + token)
+    return token
 
 
 def list_keys() -> None:

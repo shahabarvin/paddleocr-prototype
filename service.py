@@ -48,6 +48,7 @@ app = FastAPI(title="PaddleOCR OCR service",
 service = OCRService()
 store = Store(DB_PATH, seats=SEATS)
 _ready = {"state": "loading", "error": None}
+_stop = threading.Event()   # set on shutdown so the worker loop exits cleanly
 
 
 # --------------------------------------------------------------------------
@@ -64,6 +65,7 @@ def require_auth(authorization: str = Header(None)) -> None:
 
 @app.on_event("startup")
 def _startup() -> None:
+    _stop.clear()
     store.init()
     if auth_enabled() and not has_any_key():
         print("WARNING: auth is ON but no API keys exist yet. All requests will "
@@ -71,6 +73,11 @@ def _startup() -> None:
               "(or set OCR_AUTH=off for local dev).")
     threading.Thread(target=_warmup, daemon=True).start()
     threading.Thread(target=_worker_loop, daemon=True).start()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    _stop.set()
 
 
 def _warmup() -> None:
@@ -86,25 +93,28 @@ def _worker_loop() -> None:
     """Claim queued jobs and run them on this worker's pipeline, one at a time
     (the pipeline is single-threaded). Two such loops in two processes give the
     two-pipeline parallelism; the shared store balances work between them."""
-    while _ready["state"] == "loading":
+    while _ready["state"] == "loading" and not _stop.is_set():
         time.sleep(0.2)
-    if _ready["state"] != "ready":
-        return
     ticks = 0
-    while True:
-        # Cheap read first; only take the write lock when there's work to claim.
-        if not store.has_queued():
-            time.sleep(0.05)              # idle poll
-            ticks += 1
-            if ticks % 400 == 0:          # ~every 20s idle, purge expired rows
-                try:
+    while not _stop.is_set():
+        # Any transient error (e.g. SQLite busy) must not kill the loop — back
+        # off and keep going, or the worker would silently stop processing.
+        try:
+            if _ready["state"] != "ready":
+                time.sleep(0.2)
+                continue
+            # Cheap read first; only take the write lock when there's work.
+            if not store.has_queued():
+                time.sleep(0.05)          # idle poll
+                ticks += 1
+                if ticks % 400 == 0:      # ~every 20s idle, purge expired rows
                     store.cleanup()
-                except Exception:
-                    pass
-            continue
-        job = store.claim_next(WORKER_ID)
-        if job is not None:
-            _run(job)
+                continue
+            job = store.claim_next(WORKER_ID)
+            if job is not None:
+                _run(job)
+        except Exception:
+            time.sleep(0.2)
 
 
 def _run(job: dict) -> None:

@@ -15,6 +15,9 @@ samples/
 # transient run logs
 *.log
 
+# pytest
+.pytest_cache/
+
 # shared-state DB for the multi-worker service (runtime)
 state.db
 state.db-wal

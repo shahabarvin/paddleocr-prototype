@@ -13,27 +13,35 @@ preprocessing step before an LLM. Ships as two parts over one shared core:
 
 Both are thin layers over the framework-agnostic `OCRService` core in `app.py`.
 
-## Setup
+## Setup — one command
 
 ```powershell
-# Python 3.12 (PaddlePaddle has no 3.14 wheels yet)
+powershell -ExecutionPolicy Bypass -File .\setup.ps1          # venv + deps + GPU build + health check
+powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Warm    # also download/warm the models (~1-2 GB)
+powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Check   # doctor only (installs nothing)
+```
+
+`setup.ps1` needs **Python 3.12** on PATH (`py -3.12`). It creates the venv,
+installs dependencies, auto-detects the GPU and installs `paddlepaddle-gpu` (cu129
+by default; `-Cuda cu126`/`cu118` or `-Cpu` to override), then runs a health
+check. Re-running is safe and doubles as a **fixer**.
+
+The **`-Check` doctor** verifies Python, packages, GPU/CUDA, models, API keys,
+cloudflared, the autostart tasks and the live service — and prints exactly what to
+fix. So a fresh Windows install can be brought up (or debugged) **without AI**.
+
+<details><summary>Manual setup (what <code>setup.ps1</code> automates)</summary>
+
+```powershell
 py -3.12 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
-```
-
-### GPU (recommended)
-
-`requirements.txt` installs the **CPU** build. For an NVIDIA GPU, replace it with
-the matching GPU build — the CUDA runtime libraries come bundled as pip
-dependencies, so no separate CUDA toolkit is needed:
-
-```powershell
+# GPU: replace the CPU wheel (CUDA libs come bundled as pip deps, no toolkit needed).
+# cu118 / cu126 / cu129 by GPU generation; Blackwell (RTX 50-series) needs cu129.
 .venv\Scripts\python -m pip uninstall -y paddlepaddle
-# cu118 / cu126 / cu129 by GPU generation. Blackwell (RTX 50-series) needs cu129.
 .venv\Scripts\python -m pip install "paddlepaddle-gpu==3.3.1" `
-  -i https://www.paddlepaddle.org.cn/packages/stable/cu129/ `
-  --extra-index-url https://pypi.org/simple
+  -i https://www.paddlepaddle.org.cn/packages/stable/cu129/ --extra-index-url https://pypi.org/simple
 ```
+</details>
 
 The first ever start downloads the models (~1–2 GB) into
 `~/.paddlex/official_models` (counted as "model load", never as inference).
@@ -112,22 +120,56 @@ token is shown only at creation. With auth on and no keys yet, every request is
 `OCR_DEVICE` (gpu) · `OCR_DB` (state.db) · `OCR_AUTH` (on; `off` for local dev) ·
 `OCR_KEYS_FILE` (api_keys.json) · `OCR_MAX_UPLOAD_MB` (20).
 
-## Deployment (this server)
+## Deployment & portability
 
-Exposed to the internet via **Cloudflare Tunnel** — no port-forwarding, and the
-service stays bound to `127.0.0.1` (the tunnel is the only ingress):
+Exposed to the internet via **Cloudflare Tunnel** — no port-forwarding; the
+service stays bound to `127.0.0.1` (the tunnel is the only ingress). One command
+connects a machine to a subdomain on your Cloudflare account (logs in, creates the
+tunnel, adds the DNS route, writes `~/.cloudflared/config.yml`):
 
-- Domain `voiceaccountant.com` on Cloudflare (free plan); subdomain
-  `ocr.voiceaccountant.com` → tunnel `ocr-tunnel` → `http://127.0.0.1:8000`.
-- Tunnel config: `~/.cloudflared/config.yml`.
-- **Auto-start on boot:** run [install_autostart.ps1](install_autostart.ps1) once
-  in an **elevated** PowerShell. It registers two Windows scheduled tasks that
-  start at boot (no login required): **`OCR-Server`** (runs
-  [start_ocr.cmd](start_ocr.cmd) → `serve.py`) and **`Cloudflare-Tunnel`** (runs
-  the tunnel).
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup_tunnel.ps1 -Hostname ocr.voiceaccountant.com
+```
+
+**Auto-start on boot** (survives reboots headlessly, no login required) — run once
+in an **elevated** PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
+```
+
+It registers two Windows scheduled tasks: **`OCR-Server`** (runs
+[start_ocr.cmd](start_ocr.cmd) → `serve.py`) and **`Cloudflare-Tunnel`** (runs the
+tunnel). Both scripts derive all paths at runtime, so they work after re-cloning
+anywhere.
+
+### A second machine / subdomain
+
+Same Cloudflare account, a new subdomain, a separate tunnel — no code changes:
+
+```powershell
+git clone https://github.com/shahabarvin/paddleocr-prototype && cd paddleocr-prototype
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+powershell -ExecutionPolicy Bypass -File .\setup_tunnel.ps1 -Hostname ocr2.voiceaccountant.com -TunnelName ocr2-tunnel
+.venv\Scripts\python keys.py create "laravel-prod"
+powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1 -TunnelName ocr2-tunnel   # elevated
+```
 
 Security: bearer auth is the app-level guard; optionally add **Cloudflare Access**
 (service token) at the edge for a second layer before traffic reaches the origin.
+
+## Tests
+
+```powershell
+.venv\Scripts\python -m pip install -r requirements-dev.txt
+.venv\Scripts\python -m pytest
+```
+
+Unit tests (no GPU) cover the SQLite store (seats, dedup, stale-reclaim, TTL),
+bearer auth + key rotation, and the OCR helpers (device fallback, enhance, text
+normalization). An API suite drives the real FastAPI endpoints (auth, `413` size
+limit, async submit→poll, idempotency, public `/docs` + `/openapi.yaml`) with the
+GPU work mocked — so the whole suite runs in ~2 s on any machine.
 
 ## Laravel integration
 
