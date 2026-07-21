@@ -46,6 +46,7 @@ def client(tmp_path, monkeypatch):
     with TestClient(service.app) as c:
         service._ready["state"] = "ready"                                 # skip real warmup gate
         c.h = {"Authorization": f"Bearer {tok}"}
+        c.jobs = tmp_path / "output"
         yield c
 
 
@@ -116,6 +117,13 @@ def test_submit_and_poll(client):
         time.sleep(0.1)
     assert job["status"] == "done"
     assert job["result"]["markdown"] == "# hi"
+
+    # debug artifact: output/<pid>/debug.json with input + output
+    dbg = client.jobs / pid / "debug.json"
+    assert dbg.exists()
+    d = json.loads(dbg.read_text(encoding="utf-8"))
+    assert d["input"]["key"] == "job1"
+    assert d["output"]["markdown"] == "# hi"
 
 
 def test_idempotent_duplicate(client):

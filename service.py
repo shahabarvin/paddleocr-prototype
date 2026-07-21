@@ -21,7 +21,9 @@ the same key never start a second OCR; they join or return the existing job.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
+import json
 import os
 import re
 import threading
@@ -42,6 +44,8 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf", ".bmp", ".webp"}
 SEATS = int(os.environ.get("OCR_SEATS", "3"))
 MAX_UPLOAD_BYTES = int(os.environ.get("OCR_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 WORKER_ID = str(os.getpid())
+# Debug: write output/<process_id>/debug.json (input + output) per request.
+DEBUG_ENABLED = os.environ.get("OCR_DEBUG", "1").strip().lower() not in ("0", "off", "false")
 
 app = FastAPI(title="PaddleOCR OCR service",
               docs_url=None, redoc_url=None, openapi_url=None)
@@ -117,12 +121,33 @@ def _worker_loop() -> None:
             time.sleep(0.2)
 
 
+def _write_debug(job_dir: Path, options: dict, output: dict) -> None:
+    """Debug artifact: one JSON per request with its input and output."""
+    if not DEBUG_ENABLED:
+        return
+    try:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "worker": WORKER_ID,
+            "input": {k: options.get(k) for k in
+                      ("key", "filename", "bytes", "tier", "device",
+                       "enhance", "overlays", "input_path")},
+            "output": output,
+        }
+        (job_dir / "debug.json").write_text(
+            json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _run(job: dict) -> None:
     pid = job["process_id"]
     opt = job["options"]
+    job_dir = JOBS_DIR / pid
     try:
         input_path = Path(opt["input_path"])
-        viz_dir = (JOBS_DIR / pid / "viz") if opt.get("overlays") else None
+        viz_dir = (job_dir / "viz") if opt.get("overlays") else None
         t0 = time.perf_counter()
         result = service.process(
             input_path, viz_dir=viz_dir, tier=opt.get("tier", "server"),
@@ -133,7 +158,6 @@ def _run(job: dict) -> None:
         result["worker"] = WORKER_ID
         # persist the text artifacts alongside the input (durable, and handy
         # for debugging); the JSON result is the store's source of truth.
-        job_dir = JOBS_DIR / pid
         (job_dir / "result.md").write_text(result.get("markdown", ""), encoding="utf-8")
         (job_dir / "result.txt").write_text(result.get("layout_text", ""), encoding="utf-8")
         result["visualizations"] = [
@@ -141,8 +165,11 @@ def _run(job: dict) -> None:
             for p in result.get("visualizations", [])
         ]
         store.complete(pid, result)
+        _write_debug(job_dir, opt, result)
     except Exception as err:
-        store.fail(pid, f"{type(err).__name__}: {err}")
+        err_out = {"status": "failed", "error": f"{type(err).__name__}: {err}"}
+        store.fail(pid, err_out["error"])
+        _write_debug(job_dir, opt, err_out)
 
 
 # --------------------------------------------------------------------------
@@ -201,6 +228,9 @@ def submit(
         "enhance": (enhance == "1"),
         "overlays": (overlays == "1"),
         "input_path": str(input_path),
+        "key": key.strip() or None,
+        "filename": file.filename,
+        "bytes": len(data),
     }
     res = store.submit(process_id, options)
 

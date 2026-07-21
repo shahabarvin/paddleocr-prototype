@@ -118,7 +118,8 @@ token is shown only at creation. With auth on and no keys yet, every request is
 
 `OCR_WORKERS` (2) · `OCR_SEATS` (3) · `OCR_HOST` (127.0.0.1) · `OCR_PORT` (8000) ·
 `OCR_DEVICE` (gpu) · `OCR_DB` (state.db) · `OCR_AUTH` (on; `off` for local dev) ·
-`OCR_KEYS_FILE` (api_keys.json) · `OCR_MAX_UPLOAD_MB` (20).
+`OCR_KEYS_FILE` (api_keys.json) · `OCR_MAX_UPLOAD_MB` (20) · `OCR_DEBUG` (1; writes
+`output/<process_id>/debug.json` with the request input + output — `0` to disable).
 
 ## Deployment & portability
 
