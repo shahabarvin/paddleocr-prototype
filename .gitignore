@@ -26,5 +26,8 @@ state.db-shm
 # API bearer keys (hashes, but keep out of the repo)
 api_keys.json
 
+# auto-generated secret (from a webui dependency) — never commit
+.webui_secret_key
+
 # DNS migration snapshots (may contain infra detail)
 dns_snapshot*.txt
