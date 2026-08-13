@@ -1,0 +1,4 @@
+powershell -ExecutionPolicy Bypass -File .\restart.ps1
+از هر جای دیگر: با مسیر کامل بزن (فرقی نمی‌کند کجای سیستم باشی):
+
+powershell -ExecutionPolicy Bypass -File "D:\projects\paddleocr-prototype\restart.ps1"
