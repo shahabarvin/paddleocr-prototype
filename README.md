@@ -144,6 +144,10 @@ It registers two Windows scheduled tasks: **`OCR-Server`** (runs
 tunnel). Both scripts derive all paths at runtime, so they work after re-cloning
 anywhere.
 
+**Recover without a reboot** (if the service goes down): run
+[restart.ps1](restart.ps1) — it restarts both tasks and waits until the service is
+ready again. A reboot also brings everything up automatically.
+
 ### A second machine / subdomain
 
 Same Cloudflare account, a new subdomain, a separate tunnel — no code changes:
