@@ -139,14 +139,15 @@ in an **elevated** PowerShell:
 powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
 ```
 
-It registers two Windows scheduled tasks: **`OCR-Server`** (runs
-[start_ocr.cmd](start_ocr.cmd) → `serve.py`) and **`Cloudflare-Tunnel`** (runs the
-tunnel). Both scripts derive all paths at runtime, so they work after re-cloning
-anywhere.
+It registers three Windows scheduled tasks: **`OCR-Server`** (runs
+[start_ocr.cmd](start_ocr.cmd) → `serve.py`), **`Cloudflare-Tunnel`** (runs the
+tunnel), and **`OCR-Watchdog`** (every 3 min: runs [restart.ps1](restart.ps1) if
+the service is down — self-healing without a reboot). All scripts derive their
+paths at runtime, so they work after re-cloning anywhere.
 
-**Recover without a reboot** (if the service goes down): run
-[restart.ps1](restart.ps1) — it restarts both tasks and waits until the service is
-ready again. A reboot also brings everything up automatically.
+Recovery is automatic: a **reboot/power-cycle** starts the tasks at boot, and the
+**watchdog** brings the service back within ~3 min if it ever crashes. To recover
+immediately by hand, run [restart.ps1](restart.ps1).
 
 ### A second machine / subdomain
 

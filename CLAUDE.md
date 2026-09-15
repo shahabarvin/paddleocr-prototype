@@ -34,9 +34,9 @@ The service always binds `127.0.0.1`; the tunnel is the only ingress. Auth is a
 bearer token (see `keys.py`). Interactive docs + tester: `GET /docs`; spec: `GET
 /openapi.yaml`; liveness: `GET /healthz`.
 
-**Recover if it goes down** (no reboot): `powershell -File .\restart.ps1` —
-restarts both scheduled tasks and waits until ready. A reboot also brings it up
-automatically (the tasks run at boot).
+**Recovery is automatic:** the `OCR-Watchdog` task checks every 3 min and runs
+`restart.ps1` if the service is down; a reboot/power-cycle also starts everything
+at boot. To recover by hand now: `powershell -File .\restart.ps1`.
 
 ## Tests
 

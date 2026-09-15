@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-  Register two scheduled tasks that start at boot (no login required):
-    OCR-Server        -> start_ocr.cmd (the multi-worker OCR service)
-    Cloudflare-Tunnel -> cloudflared tunnel run <TunnelName>
+  Register three scheduled tasks (no login required):
+    OCR-Server        -> start_ocr.cmd (the multi-worker OCR service)  [at boot]
+    Cloudflare-Tunnel -> cloudflared tunnel run <TunnelName>           [at boot]
+    OCR-Watchdog      -> watchdog.ps1 (restart if down)               [every 3 min]
 
   Portable: all paths are derived at runtime, so it works after re-cloning to a
   new machine/folder. Run ONCE in an ELEVATED (Administrator) PowerShell:
@@ -10,7 +11,8 @@
     powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
     powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1 -TunnelName ocr2-tunnel
 
-  Remove with:  Unregister-ScheduledTask OCR-Server,Cloudflare-Tunnel -Confirm:$false
+  Remove with:
+    Unregister-ScheduledTask OCR-Server,Cloudflare-Tunnel,OCR-Watchdog -Confirm:$false
 #>
 param(
   [string]$TunnelName = "ocr-tunnel"
@@ -44,6 +46,14 @@ Register-ScheduledTask -TaskName "Cloudflare-Tunnel" -Force -Principal $principa
     -Action (New-ScheduledTaskAction -Execute $cf -Argument "tunnel run $TunnelName") `
     -Description "Cloudflare tunnel '$TunnelName'"
 
-Write-Host "`nRegistered (start at boot):" -ForegroundColor Green
-Get-ScheduledTask -TaskName "OCR-Server","Cloudflare-Tunnel" | Format-Table TaskName, State
-Write-Host "Start now without rebooting:  Start-ScheduledTask OCR-Server ; Start-ScheduledTask Cloudflare-Tunnel"
+# Self-heal: check /healthz every 3 minutes; if down, run restart.ps1.
+$wtrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 3650)
+Register-ScheduledTask -TaskName "OCR-Watchdog" -Force -Principal $principal -Trigger $wtrigger -Settings $settings `
+    -Action (New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument ("-ExecutionPolicy Bypass -NonInteractive -File `"" + (Join-Path $proj "watchdog.ps1") + "`"")) `
+    -Description "Restart the OCR service if it goes down (health check every 3 min)"
+
+Write-Host "`nRegistered:" -ForegroundColor Green
+Get-ScheduledTask -TaskName "OCR-Server","Cloudflare-Tunnel","OCR-Watchdog" | Format-Table TaskName, State
+Write-Host "Start now:  Start-ScheduledTask OCR-Server ; Start-ScheduledTask Cloudflare-Tunnel ; Start-ScheduledTask OCR-Watchdog"
