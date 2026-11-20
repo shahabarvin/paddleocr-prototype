@@ -147,7 +147,7 @@ def _write_debug(job_dir: Path, options: dict, output: dict) -> None:
 def _run(job: dict) -> None:
     pid = job["process_id"]
     opt = job["options"]
-    job_dir = JOBS_DIR / pid
+    job_dir = Path(opt["input_path"]).parent    # the dated folder submit created
     try:
         job_dir.mkdir(parents=True, exist_ok=True)  # normally made at submit; be robust
         input_path = Path(opt["input_path"])
@@ -224,7 +224,9 @@ def submit(
         process_id = h.hexdigest()[:24]
 
     # Persist input where any worker can read it, before it becomes claimable.
-    job_dir = JOBS_DIR / process_id
+    # Grouped under the day's folder: output/<YYYY-MM-DD>/<process_id>/.
+    day = datetime.date.today().isoformat()
+    job_dir = JOBS_DIR / day / process_id
     job_dir.mkdir(parents=True, exist_ok=True)
     input_path = job_dir / f"input{ext}"
     if not input_path.exists():
@@ -258,9 +260,30 @@ def get_job(process_id: str) -> JSONResponse:
     return JSONResponse(job, status_code=code)
 
 
+def _find_job_dir(pid: str):
+    """A job's folder: output/<date>/<pid> (new, grouped by day) or the old
+    output/<pid> (legacy jobs). Returns None if nothing matches."""
+    legacy = JOBS_DIR / pid
+    if legacy.is_dir():
+        return legacy
+    for d in JOBS_DIR.glob(f"*/{pid}"):
+        if d.is_dir():
+            return d
+    return None
+
+
 @app.get("/files/{process_id}/{path:path}", dependencies=[Depends(require_auth)])
 def serve_file(process_id: str, path: str) -> FileResponse:
-    target = (JOBS_DIR / _slug(process_id) / path).resolve()
+    job_dir = _find_job_dir(_slug(process_id))
+    if job_dir is None:
+        raise HTTPException(404)
+    if path == "input":                       # convenience: serve input.<ext>
+        matches = sorted(job_dir.glob("input.*"))
+        if not matches:
+            raise HTTPException(404)
+        target = matches[0].resolve()
+    else:
+        target = (job_dir / path).resolve()
     if not target.is_file() or JOBS_DIR.resolve() not in target.parents:
         raise HTTPException(404)
     return FileResponse(target)
@@ -479,13 +502,14 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     bv.appendChild(note);
   }
 
-  function openDebug(pid) {
-    fetch('/files/' + encodeURIComponent(pid) + '/debug.json',
+  function openFile(pid, path) {
+    fetch('/files/' + encodeURIComponent(pid) + '/' + path,
           { headers: { Authorization: 'Bearer ' + keyEl.value } })
       .then(function (r) { if (!r.ok) throw new Error(r.status); return r.blob(); })
       .then(function (b) { window.open(URL.createObjectURL(b), '_blank'); })
-      .catch(function (e) { alert('no debug.json (' + e.message + ')'); });
+      .catch(function (e) { alert(path + ' not available (' + e.message + ')'); });
   }
+  function openDebug(pid) { openFile(pid, 'debug.json'); }
 
   // Quick test: upload a file straight from the dashboard and watch it run.
   var sendBtn = document.getElementById('f_send'), fOut = document.getElementById('f_out');
@@ -581,7 +605,11 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
             + '<td>' + fmtDur(waited) + '</td><td>' + fmtDur(run) + '</td>'
             + '<td>' + new Date(j.updated_at * 1000).toLocaleTimeString() + '</td>'
             + '<td class="err" title="' + esc(j.error || '') + '">' + esc(j.error || '') + '</td>'
-            + '<td><button onclick="openDebug(\\'' + esc(j.process_id) + '\\')">debug</button></td></tr>';
+            + '<td>'
+            + '<button onclick="openFile(\\'' + esc(j.process_id) + '\\',\\'input\\')">input</button> '
+            + '<button onclick="openFile(\\'' + esc(j.process_id) + '\\',\\'result.md\\')">md</button> '
+            + '<button onclick="openDebug(\\'' + esc(j.process_id) + '\\')">debug</button>'
+            + '</td></tr>';
         });
         document.getElementById('rows').innerHTML =
           html || '<tr><td colspan="8" style="color:#8b98a9">no jobs in this time window</td></tr>';

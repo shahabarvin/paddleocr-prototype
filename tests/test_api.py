@@ -122,12 +122,31 @@ def test_submit_and_poll(client):
     assert job["status"] == "done"
     assert job["result"]["markdown"] == "# hi"
 
-    # debug artifact: output/<pid>/debug.json with input + output
-    dbg = client.jobs / pid / "debug.json"
-    assert dbg.exists()
+    # debug artifact: output/<date>/<pid>/debug.json with input + output
+    matches = list(client.jobs.glob(f"*/{pid}/debug.json"))
+    assert len(matches) == 1
+    dbg = matches[0]
+    assert dbg.parent.parent.name == __import__("datetime").date.today().isoformat()
     d = json.loads(dbg.read_text(encoding="utf-8"))
     assert d["input"]["key"] == "job1"
     assert d["output"]["markdown"] == "# hi"
+
+
+def test_serve_file_resolves_date_folder(client):
+    r = client.post("/api/ocr", headers=client.h, files={"file": _png()},
+                    data={"key": "jobf", "model": "server"})
+    pid = r.json()["process_id"]
+    for _ in range(50):
+        if client.get(f"/api/ocr/{pid}", headers=client.h).json()["status"] in ("done", "failed"):
+            break
+        time.sleep(0.1)
+    # /files/<pid>/input finds input.<ext> under the date folder without the ext
+    ri = client.get(f"/files/{pid}/input", headers=client.h)
+    assert ri.status_code == 200 and ri.content == b"x" * 8
+    # and named artifacts resolve the same way
+    rm = client.get(f"/files/{pid}/result.md", headers=client.h)
+    assert rm.status_code == 200 and "# hi" in rm.text
+    assert client.get(f"/files/{pid}/nope.txt", headers=client.h).status_code == 404
 
 
 def test_idempotent_duplicate(client):
