@@ -386,6 +386,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .s.done { background: #2a5a38; }      .s.failed { background: #6a2a2a; }
   #msg { color: #e0b97a; margin-bottom: 10px; }
   button { background: #39465a; border: 0; color: #d7dde6; padding: 2px 9px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+  button:disabled { opacity: .38; cursor: not-allowed; }
   select { background: #11161d; border: 1px solid #39465a; color: #d7dde6; padding: 5px 6px; border-radius: 5px; }
   .test, .range { background: #1a212b; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .test #f_send { padding: 5px 14px; background: #2a5a38; }
@@ -395,6 +396,11 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .boxwrap { position: relative; display: inline-block; max-width: 520px; border: 1px solid #39465a; border-radius: 6px; overflow: hidden; }
   .boxwrap img { display: block; max-width: 520px; height: auto; }
   .boxsvg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 50; align-items: center; justify-content: center; padding: 20px; }
+  .modalcard { background: #1a212b; border: 1px solid #39465a; border-radius: 10px; padding: 14px; max-width: 92vw; max-height: 92vh; overflow: auto; }
+  .modalhead { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+  .modalhead b { font-family: monospace; font-size: 13px; margin-right: auto; word-break: break-all; }
+  .boxwrap.modalwrap, .boxwrap.modalwrap img { max-width: min(80vw, 900px); }
 </style>
 </head>
 <body>
@@ -441,6 +447,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <tbody id="rows"></tbody>
   </table>
 </main>
+<div id="boxmodal" class="modal" onclick="if(event.target===this)closeBoxes()">
+  <div class="modalcard">
+    <div class="modalhead"><b id="bm_title">boxes</b><button onclick="closeBoxes()">close</button></div>
+    <div id="bm_body"></div>
+  </div>
+</div>
 <script>
   var keyEl = document.getElementById('key');
   keyEl.value = localStorage.getItem('ocr_key') || '';
@@ -461,17 +473,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     if (s >= 0.6) return '#e0b97a';
     return '#e07a7a';
   }
-  function renderBoxes(file, lines) {
-    var bv = document.getElementById('boxview');
-    bv.innerHTML = '';
-    if (!file.type || file.type.indexOf('image') !== 0) {
-      bv.textContent = 'box overlay is image-only (PDF pages are not drawn)';
-      return;
-    }
-    if (!lines || !lines.length) return;
+  // Draw one SVG overlay (a rect per line, colored by score) over an <img>.
+  // Shared by the quick-test (in-browser File) and the per-row modal (saved file).
+  function paintBoxes(wrap, img, lines) {
     var SVGNS = 'http://www.w3.org/2000/svg';
-    var wrap = document.createElement('div'); wrap.className = 'boxwrap';
-    var img = document.createElement('img'); img.src = URL.createObjectURL(file);
     img.onload = function () {
       var svg = document.createElementNS(SVGNS, 'svg');
       svg.setAttribute('class', 'boxsvg');
@@ -494,13 +499,71 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       wrap.appendChild(svg);
     };
     wrap.appendChild(img);
-    bv.appendChild(wrap);
+  }
+  function boxNote(n) {
     var note = document.createElement('div');
     note.style.cssText = 'color:#8b98a9;font-size:12px;margin-top:4px';
-    note.textContent = lines.length +
-      ' lines — hover a box for its text + score (green \\u22650.8, amber \\u22650.6, red <0.6)';
-    bv.appendChild(note);
+    note.textContent = n + ' lines — hover a box for its text + score ' +
+      '(green \\u22650.8, amber \\u22650.6, red <0.6)';
+    return note;
   }
+  function renderBoxes(file, lines) {
+    var bv = document.getElementById('boxview');
+    bv.innerHTML = '';
+    if (!file.type || file.type.indexOf('image') !== 0) {
+      bv.textContent = 'box overlay is image-only (PDF pages are not drawn)';
+      return;
+    }
+    if (!lines || !lines.length) return;
+    var wrap = document.createElement('div'); wrap.className = 'boxwrap';
+    var img = document.createElement('img'); img.src = URL.createObjectURL(file);
+    paintBoxes(wrap, img, lines);
+    bv.appendChild(wrap);
+    bv.appendChild(boxNote(lines.length));
+  }
+
+  // Per-row "box": rebuild a saved record's overlay from disk (input image +
+  // debug.json lines), so it survives refreshes and never depends on the
+  // quick-test render still being on screen. Needs the job to have run boxes=1.
+  function closeBoxes() {
+    document.getElementById('boxmodal').style.display = 'none';
+    document.getElementById('bm_body').innerHTML = '';
+  }
+  function openBoxes(pid) {
+    var H = { headers: { Authorization: 'Bearer ' + keyEl.value } };
+    var body = document.getElementById('bm_body');
+    document.getElementById('bm_title').textContent = pid;
+    body.textContent = 'loading...';
+    document.getElementById('boxmodal').style.display = 'flex';
+    fetch('/files/' + encodeURIComponent(pid) + '/debug.json', H)
+      .then(function (r) { if (!r.ok) throw new Error('debug.json ' + r.status); return r.json(); })
+      .then(function (dbg) {
+        var lines = dbg && dbg.output && dbg.output.lines && dbg.output.lines[0];
+        if (!lines || !lines.length) {
+          body.innerHTML = '<div style="color:#e0b97a">No box data saved for this job.<br>' +
+            'Re-run it with a <b>new key</b> and \\u201cshow boxes\\u201d ticked to capture boxes.</div>';
+          return;
+        }
+        return fetch('/files/' + encodeURIComponent(pid) + '/input', H)
+          .then(function (r) { if (!r.ok) throw new Error('input ' + r.status); return r.blob(); })
+          .then(function (blob) {
+            if (blob.type && blob.type.indexOf('image') !== 0) {
+              body.textContent = 'box overlay is image-only (this input is not an image).';
+              return;
+            }
+            body.innerHTML = '';
+            var wrap = document.createElement('div'); wrap.className = 'boxwrap modalwrap';
+            var img = document.createElement('img'); img.src = URL.createObjectURL(blob);
+            paintBoxes(wrap, img, lines);
+            body.appendChild(wrap);
+            body.appendChild(boxNote(lines.length));
+          });
+      })
+      .catch(function (e) {
+        body.innerHTML = '<div style="color:#e07a7a">could not load boxes: ' + esc(e.message) + '</div>';
+      });
+  }
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeBoxes(); });
 
   function openFile(pid, path) {
     fetch('/files/' + encodeURIComponent(pid) + '/' + path,
@@ -608,7 +671,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
             + '<td>'
             + '<button onclick="openFile(\\'' + esc(j.process_id) + '\\',\\'input\\')">input</button> '
             + '<button onclick="openFile(\\'' + esc(j.process_id) + '\\',\\'result.md\\')">md</button> '
-            + '<button onclick="openDebug(\\'' + esc(j.process_id) + '\\')">debug</button>'
+            + '<button onclick="openDebug(\\'' + esc(j.process_id) + '\\')">debug</button> '
+            + (j.has_boxes
+                ? '<button onclick="openBoxes(\\'' + esc(j.process_id) + '\\')">box</button>'
+                : '<button disabled title="no box data \\u2014 re-run with a new key + \\u201cshow boxes\\u201d">box</button>')
             + '</td></tr>';
         });
         document.getElementById('rows').innerHTML =

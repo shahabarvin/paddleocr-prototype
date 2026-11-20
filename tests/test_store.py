@@ -35,6 +35,20 @@ def test_claim_and_complete(st):
     assert done["result"]["markdown"] == "hi"
 
 
+def test_recent_has_boxes_flag(st):
+    # a job whose result carries a `lines` array -> has_boxes=1; one without -> 0;
+    # an unfinished job -> 0. Lets the dashboard enable/disable the "box" button.
+    st.submit("withbox", opt()); st.claim_next("w1")
+    st.complete("withbox", {"markdown": "hi", "lines": [[{"text": "x", "box": [0, 0, 1, 1], "score": 0.9}]]})
+    st.submit("nobox", opt()); st.claim_next("w1")
+    st.complete("nobox", {"markdown": "hi"})
+    st.submit("pending", opt())
+    flags = {j["process_id"]: j["has_boxes"] for j in st.recent(50)}
+    assert flags["withbox"] == 1
+    assert flags["nobox"] == 0
+    assert flags["pending"] == 0
+
+
 def test_seat_cap(st):                    # seats = 2
     assert st.submit("a", opt())["status"] == "started"
     assert st.submit("b", opt())["status"] == "started"

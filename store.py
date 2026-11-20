@@ -247,7 +247,7 @@ class Store:
         """Jobs newest-first for the dashboard, optionally bounded to a created_at
         window [since, until] (epoch seconds). No result payloads."""
         cols = ("process_id", "status", "worker", "error",
-                "created_at", "claimed_at", "updated_at")
+                "created_at", "claimed_at", "updated_at", "has_boxes")
         clauses, params = [], []
         if since is not None:
             clauses.append("created_at >= ?"); params.append(float(since))
@@ -255,9 +255,14 @@ class Store:
             clauses.append("created_at <= ?"); params.append(float(until))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(max(1, min(int(limit), 2000)))
+        # has_boxes: 1 only when the stored result actually carries a per-line
+        # `lines` array (job ran with boxes=1), so the dashboard can enable/disable
+        # the "box" button without shipping the result payload.
         rows = self._conn().execute(
             "SELECT process_id, status, worker, error, created_at, claimed_at, "
-            f"updated_at FROM jobs {where} ORDER BY created_at DESC LIMIT ?",
+            "updated_at, (CASE WHEN result IS NOT NULL AND "
+            "instr(result, '\"lines\"') > 0 THEN 1 ELSE 0 END) AS has_boxes "
+            f"FROM jobs {where} ORDER BY created_at DESC LIMIT ?",
             params,
         ).fetchall()
         return [dict(zip(cols, r)) for r in rows]
