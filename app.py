@@ -226,6 +226,7 @@ class OCRService:
         tier: str = "server",
         device: Optional[str] = None,
         enhance: bool = False,
+        with_lines: bool = False,
     ) -> dict[str, Any]:
         """Run PP-StructureV3 on one image/PDF file.
 
@@ -238,35 +239,54 @@ class OCRService:
         load_seconds = self.load(tier, device)  # no-op if already loaded
         pipeline = self._pipelines[(tier, eff)]
 
-        # Optional pre-processing: enhance faded/noisy images and feed the
-        # cleaned pixels (ndarray) to the pipeline instead of the raw file.
-        predict_input: Any = str(input_path)
+        # Run the ORIGINAL image first. The enhancement pre-pass (CLAHE/denoise/
+        # upscale) rescues faded or noisy captures but GARBLES already-clean scans
+        # (it turned a crisp bank slip into "AOEAAE...SARSRAEESRRA"), so we only
+        # reach for it as a fallback -- when the original came back with almost no
+        # text -- and even then keep it only if it actually recovered more.
+        t0 = time.perf_counter()
+        with self._predict_lock:
+            outputs = list(pipeline.predict(str(input_path)))
+        inference_seconds = round(time.perf_counter() - t0, 3)
+        markdown = self._to_markdown(pipeline, outputs)
+        layout_text = self._layout_text(outputs)
         enhanced_applied = False
-        if enhance and Path(input_path).suffix.lower() != ".pdf":
+
+        if (enhance and Path(input_path).suffix.lower() != ".pdf"
+                and not self._enough_text(layout_text)):
             import cv2
             raw = cv2.imread(str(input_path))
             if raw is not None:
-                enhanced = self._enhance_image(raw)
-                predict_input = enhanced
-                enhanced_applied = True
-                if viz_dir is not None:
-                    Path(viz_dir).mkdir(parents=True, exist_ok=True)
-                    cv2.imwrite(str(Path(viz_dir) / "00_input_enhanced.png"), enhanced)
-
-        t0 = time.perf_counter()
-        with self._predict_lock:
-            outputs = list(pipeline.predict(predict_input))
-        inference_seconds = round(time.perf_counter() - t0, 3)
+                enh_img = self._enhance_image(raw)
+                te = time.perf_counter()
+                with self._predict_lock:
+                    outputs_e = list(pipeline.predict(enh_img))
+                inference_seconds += round(time.perf_counter() - te, 3)
+                md_e = self._to_markdown(pipeline, outputs_e)
+                lt_e = self._layout_text(outputs_e)
+                if len(lt_e.strip()) > len(layout_text.strip()):   # enhancement helped
+                    outputs, markdown, layout_text = outputs_e, md_e, lt_e
+                    enhanced_applied = True
+                    if viz_dir is not None:
+                        Path(viz_dir).mkdir(parents=True, exist_ok=True)
+                        cv2.imwrite(str(Path(viz_dir) / "00_input_enhanced.png"), enh_img)
 
         t1 = time.perf_counter()
-        markdown = self._to_markdown(pipeline, outputs)
-        layout_text = self._layout_text(outputs)
+        # Fall back to the complete spatial text when the structured markdown is
+        # unreliable: either a figure-only page (just an <img> placeholder, no text)
+        # or a page where markdown silently dropped recognized fields -- e.g. a
+        # two-column slip whose "From Account" value never made it into markdown.
+        if layout_text.strip() and (
+                not self._has_text(markdown)
+                or len(self._dropped_tokens(markdown, layout_text)) >= 2):
+            markdown = layout_text
+        lines = self._extract_lines(outputs) if with_lines else None
         viz_files: list[str] = []
         if viz_dir is not None:
             viz_files = self._save_visualizations(outputs, Path(viz_dir))
         postprocess_seconds = round(time.perf_counter() - t1, 3)
 
-        return {
+        result = {
             "pages": len(outputs),
             "markdown": markdown,
             "layout_text": layout_text,
@@ -284,10 +304,43 @@ class OCRService:
             },
             "visualizations": viz_files,
         }
+        if lines is not None:
+            result["lines"] = lines          # opt-in: per-line text + box + score
+        return result
 
     # -- helpers -----------------------------------------------------------
 
-    _ALNUM_RE = re.compile(r"[^\W_]")  # any unicode letter or digit
+    _ALNUM_RE = re.compile(r"[^\W_]")   # any unicode letter or digit
+    _TAG_RE = re.compile(r"<[^>]+>")
+    _WORD_RE = re.compile(r"[^\W_]+")   # runs of letters/digits
+
+    @classmethod
+    def _has_text(cls, md: str) -> bool:
+        """True if the markdown carries real text, not just HTML (e.g. an <img>
+        placeholder). Used to detect figure-only pages that need the OCR fallback."""
+        return bool(cls._ALNUM_RE.search(cls._TAG_RE.sub(" ", md or "")))
+
+    @classmethod
+    def _dropped_tokens(cls, markdown: str, layout_text: str, min_len: int = 5) -> list:
+        """Distinctive tokens (account #, reference, name...) that OCR recognized
+        -- they are in layout_text -- but the structured markdown left out. Matching
+        by substring tolerates markdown merging/reformatting words, so only genuine
+        omissions count. Signals that markdown silently dropped a field value."""
+        md_norm = cls._TAG_RE.sub(" ", markdown or "").lower()
+        dropped, seen = [], set()
+        for tok in cls._WORD_RE.findall((layout_text or "").lower()):
+            if len(tok) >= min_len and tok not in seen:
+                seen.add(tok)
+                if tok not in md_norm:
+                    dropped.append(tok)
+        return dropped
+
+    @classmethod
+    def _enough_text(cls, text: str, min_chars: int = 20) -> bool:
+        """True once a page has yielded a real amount of text -- the signal that
+        the original image read fine and must NOT be risked on the enhancement
+        pre-pass. A faded/near-blank capture falls below this and earns a retry."""
+        return sum(1 for ch in (text or "") if cls._ALNUM_RE.match(ch)) >= min_chars
 
     @classmethod
     def _is_noise(cls, text: str) -> bool:
@@ -391,6 +444,35 @@ class OCRService:
         xs = [float(pt[0]) for pt in poly]
         ys = [float(pt[1]) for pt in poly]
         return min(xs), min(ys), max(xs), max(ys)
+
+    @classmethod
+    def _extract_lines(cls, outputs: list) -> list:
+        """Per page, every recognized line as {text, box:[x1,y1,x2,y2], score} in
+        raw detection order. Opt-in diagnostic output: lets a caller see each box
+        and its confidence (incl. low-score lines nothing else surfaces) and
+        rebuild row order from the geometry. Reads the same raw OCR as layout_text."""
+        pages = []
+        for res in outputs:
+            lines = []
+            try:
+                ocr = res["overall_ocr_res"]
+                texts = list(ocr["rec_texts"])
+                scores = list(ocr.get("rec_scores", []))
+                boxes = ocr.get("rec_boxes")
+                if boxes is None or len(boxes) == 0:
+                    boxes = [cls._poly_to_bbox(p) for p in ocr["rec_polys"]]
+                for i, t in enumerate(texts):
+                    b = boxes[i]
+                    seq = list(b)[:4] if hasattr(b, "__len__") else [b]
+                    lines.append({
+                        "text": str(t),
+                        "box": [round(float(x), 1) for x in seq],
+                        "score": round(float(scores[i]), 3) if i < len(scores) else None,
+                    })
+            except Exception:
+                pass
+            pages.append(lines)
+        return pages
 
     @classmethod
     def _spatial_text(cls, items: list[tuple[float, float, float, float, str]]) -> str:

@@ -10,8 +10,9 @@ import time
 import pytest
 
 
-def _fake_process(input_path, viz_dir=None, tier="server", device=None, enhance=False):
-    return {
+def _fake_process(input_path, viz_dir=None, tier="server", device=None,
+                  enhance=False, with_lines=False):
+    out = {
         "pages": 1, "markdown": "# hi", "layout_text": "hi", "model_tier": tier,
         "device": "cpu", "device_note": None, "enhanced": bool(enhance),
         "timings": {"model_load_seconds": 0, "model_loaded_during_request": False,
@@ -19,6 +20,9 @@ def _fake_process(input_path, viz_dir=None, tier="server", device=None, enhance=
                     "postprocess_seconds": 0.0},
         "visualizations": [],
     }
+    if with_lines:
+        out["lines"] = [[{"text": "hi", "box": [0.0, 0.0, 10.0, 10.0], "score": 0.9}]]
+    return out
 
 
 @pytest.fixture

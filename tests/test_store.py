@@ -1,4 +1,5 @@
 """Unit tests for the SQLite shared store (no GPU / no models needed)."""
+import os
 import time
 
 import pytest
@@ -86,3 +87,59 @@ def test_cleanup_purges_old(st):              # ttl_seconds = 1
                        (time.time() - 10, "a"))
     assert st.cleanup() == 1
     assert st.get("a") is None
+
+
+def test_alive_worker_not_requeued(st):       # stale = 1
+    """A stale job whose worker PROCESS is still alive is left processing, so a
+    genuinely slow page is never double-processed."""
+    st.submit("a", opt())
+    st.claim_next(str(os.getpid()))           # claimed by THIS (alive) process
+    st._conn().execute("UPDATE jobs SET claimed_at=? WHERE process_id=?",
+                       (time.time() - 10, "a"))
+    st.reap_stale()
+    assert st.get("a")["status"] == "processing"
+
+
+def test_dead_worker_requeued(st):            # stale = 1
+    st.submit("a", opt())
+    st.claim_next("999999")                   # a PID that does not exist -> dead
+    st._conn().execute("UPDATE jobs SET claimed_at=? WHERE process_id=?",
+                       (time.time() - 10, "a"))
+    st.reap_stale()
+    assert st.get("a")["status"] == "queued"
+
+
+def test_hard_deadline_fails_processing(tmp_path):
+    """Past the hard deadline a job is failed even if its worker is still alive
+    (a hang) -- the seat is freed and the client gets a definitive answer."""
+    s = Store(tmp_path / "t.db", seats=2, stale_seconds=1.0, hard_seconds=5.0)
+    s.init()
+    s.submit("a", opt())
+    s.claim_next(str(os.getpid()))            # alive worker, but...
+    s._conn().execute("UPDATE jobs SET claimed_at=? WHERE process_id=?",
+                      (time.time() - 10, "a"))
+    s.reap_stale()
+    assert s.get("a")["status"] == "failed"
+
+
+def test_queued_hard_deadline_fails(tmp_path):
+    s = Store(tmp_path / "t.db", seats=2, hard_seconds=5.0)
+    s.init()
+    s.submit("a", opt())                      # queued, never claimed
+    s._conn().execute("UPDATE jobs SET created_at=? WHERE process_id=?",
+                      (time.time() - 10, "a"))
+    s.reap_stale()
+    assert s.get("a")["status"] == "failed"
+
+
+def test_poison_fails_after_max_attempts(tmp_path):
+    s = Store(tmp_path / "t.db", seats=2, stale_seconds=1.0, max_attempts=3)
+    s.init()
+    s.submit("a", opt())
+    for _ in range(3):                         # worker keeps dying on this input
+        s.claim_next("999999")
+        s._conn().execute("UPDATE jobs SET claimed_at=? WHERE process_id=?",
+                          (time.time() - 10, "a"))
+        s.reap_stale()
+    assert s.get("a")["status"] == "failed"
+    assert s.stats()["in_flight"] == 0

@@ -71,3 +71,53 @@ def test_enhance_image_binarize():
 def test_poly_to_bbox():
     bbox = OCRService._poly_to_bbox([(10, 20), (30, 20), (30, 40), (10, 40)])
     assert bbox == (10.0, 20.0, 30.0, 40.0)
+
+
+def test_has_text():
+    assert OCRService._has_text("From Account 00021473851") is True
+    assert OCRService._has_text('<div><img src="x.jpg"/></div>') is False   # image only
+    assert OCRService._has_text("") is False
+
+
+def test_enough_text():
+    assert OCRService._enough_text("a lot of real recognized text here now") is True
+    assert OCRService._enough_text("ab") is False                            # near-blank
+
+
+def test_dropped_tokens_detects_lost_field():
+    # markdown kept the label but lost the account value that OCR did read.
+    md = "From Account\n\nAmount\n\nCAD 734.50"
+    lt = "From Account   00021473851-AXLEC0RP-CAD\nAmount   CAD 734.50"
+    dropped = OCRService._dropped_tokens(md, lt)
+    assert "00021473851" in dropped and "axlec0rp" in dropped
+    assert len(dropped) >= 2                                                 # triggers fallback
+
+
+def test_dropped_tokens_clean_markdown_no_false_positive():
+    lt = "From Account 00021473851 AXLE CORP CAD Amount 734.50 Reference 998877"
+    assert OCRService._dropped_tokens(lt, lt) == []                          # identical -> none
+    # substring match tolerates markdown merging words together
+    assert OCRService._dropped_tokens("Download summary now", "Download summary") == []
+
+
+def test_extract_lines():
+    res = {"overall_ocr_res": {
+        "rec_texts": ["From Account", "00021473851-AXLEC0RP-CAD"],
+        "rec_scores": [0.991, 0.975],
+        "rec_boxes": [[10, 20, 100, 30], [190, 320, 349, 331]],
+    }}
+    pages = OCRService._extract_lines([res])
+    assert len(pages) == 1 and len(pages[0]) == 2
+    val = pages[0][1]
+    assert val["text"] == "00021473851-AXLEC0RP-CAD"
+    assert val["box"] == [190.0, 320.0, 349.0, 331.0]
+    assert val["score"] == 0.975
+
+
+def test_extract_lines_falls_back_to_polys():
+    res = {"overall_ocr_res": {
+        "rec_texts": ["hi"], "rec_scores": [0.8], "rec_boxes": None,
+        "rec_polys": [[(5, 6), (20, 6), (20, 15), (5, 15)]],
+    }}
+    line = OCRService._extract_lines([res])[0][0]
+    assert line["box"] == [5.0, 6.0, 20.0, 15.0]            # bbox from polygon

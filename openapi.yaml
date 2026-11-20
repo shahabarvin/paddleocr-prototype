@@ -47,9 +47,13 @@ info:
     - `enhance`: `1` for scans/photos/receipts (denoise+contrast, ~40% slower),
       `0` for clean digital PDFs.
     - `overlays`: keep `0` in production (`1` only saves debug overlay PNGs).
+    - `boxes`: keep `0` in production; `1` adds `result.lines` (per-line text, box
+      and confidence score) for diagnosing why a specific line looks off.
 
     ## Using the result
     - `result.markdown` — layout-aware markdown; the main text to feed your LLM.
+      If the structured markdown ever drops a value, the service automatically
+      falls back to the complete spatial text, so no recognized line is lost.
     - `result.layout_text` — plain text preserving columns/line-breaks; better for
       receipts / forms / tickets.
 
@@ -141,6 +145,11 @@ paths:
                   enum: ["0", "1"]
                   default: "0"
                   description: "1 = also save detection overlay PNGs (retrievable via /files/...)."
+                boxes:
+                  type: string
+                  enum: ["0", "1"]
+                  default: "0"
+                  description: "1 = include a `lines` array in the result: every recognized line with its text, box [x1,y1,x2,y2] and confidence score (incl. low-score lines). Diagnostic; omit in production."
       responses:
         "202":
           description: Accepted. The job was admitted (`started`) or is already running (`in_progress`).
