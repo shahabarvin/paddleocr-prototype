@@ -22,6 +22,7 @@ def _fake_process(input_path, viz_dir=None, tier="server", device=None,
     }
     if with_lines:
         out["lines"] = [[{"text": "hi", "box": [0.0, 0.0, 10.0, 10.0], "score": 0.9}]]
+        out["page_sizes"] = [[10, 10]]
     return out
 
 

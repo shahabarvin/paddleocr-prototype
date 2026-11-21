@@ -121,3 +121,11 @@ def test_extract_lines_falls_back_to_polys():
     }}
     line = OCRService._extract_lines([res])[0][0]
     assert line["box"] == [5.0, 6.0, 20.0, 15.0]            # bbox from polygon
+
+
+def test_page_size_from_input_img():
+    # [width, height] of the OCR raster the boxes are measured against, so a PDF
+    # overlay can map boxes into the same space. None when the image isn't exposed.
+    res = {"overall_ocr_res": {"input_img": np.zeros((30, 40, 3), dtype=np.uint8)}}
+    assert OCRService._page_size(res) == [40, 30]
+    assert OCRService._page_size({"overall_ocr_res": {}}) is None

@@ -47,8 +47,8 @@ info:
     - `enhance`: `1` for scans/photos/receipts (denoise+contrast, ~40% slower),
       `0` for clean digital PDFs.
     - `overlays`: keep `0` in production (`1` only saves debug overlay PNGs).
-    - `boxes`: keep `0` in production; `1` adds `result.lines` (per-line text, box
-      and confidence score) for diagnosing why a specific line looks off.
+    - `boxes`: deprecated / no-op. `result.lines` (per-line text, box and score) is
+      now always returned, so you no longer need to ask for it.
 
     ## Using the result
     - `result.markdown` — layout-aware markdown; the main text to feed your LLM.
@@ -56,6 +56,14 @@ info:
       falls back to the complete spatial text, so no recognized line is lost.
     - `result.layout_text` — plain text preserving columns/line-breaks; better for
       receipts / forms / tickets.
+    - `result.lines` — per page, every recognized line as `{text, box:[x1,y1,x2,y2],
+      score}` in detection order (incl. low-score lines). Use it for field geometry /
+      per-line confidence. Boxes are pixels in that page's raster.
+    - `result.page_sizes` — per page `[width, height]` (px) of that raster, so a box
+      can be mapped back onto the page image. `null` for a page whose size is unknown.
+      These two fields are always present; computing them adds no OCR time (the
+      coordinates are produced by recognition regardless) — only a slightly larger
+      JSON response.
 
     ## Status / error cheatsheet
     - `401` — missing/invalid/revoked token.
@@ -149,7 +157,7 @@ paths:
                   type: string
                   enum: ["0", "1"]
                   default: "0"
-                  description: "1 = include a `lines` array in the result: every recognized line with its text, box [x1,y1,x2,y2] and confidence score (incl. low-score lines). Diagnostic; omit in production."
+                  description: "Deprecated / no-op. `result.lines` (+ `result.page_sizes`) is always returned now, so this flag no longer changes anything."
       responses:
         "202":
           description: Accepted. The job was admitted (`started`) or is already running (`in_progress`).

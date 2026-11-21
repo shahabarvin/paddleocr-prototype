@@ -305,7 +305,10 @@ class OCRService:
             "visualizations": viz_files,
         }
         if lines is not None:
-            result["lines"] = lines          # opt-in: per-line text + box + score
+            result["lines"] = lines          # per-line text + box + score
+            # page raster sizes, so an overlay (esp. for PDF pages) maps boxes
+            # into the same coordinate space the browser renders.
+            result["page_sizes"] = [self._page_size(r) for r in outputs]
         return result
 
     # -- helpers -----------------------------------------------------------
@@ -473,6 +476,33 @@ class OCRService:
                 pass
             pages.append(lines)
         return pages
+
+    @staticmethod
+    def _page_size(res) -> Optional[list]:
+        """[width, height] in pixels of the image the OCR boxes are measured
+        against, so an overlay can be drawn in the same coordinate space (needed
+        for PDF pages, whose raster size the browser cannot know). None if the
+        page image is not exposed by the pipeline."""
+        candidates = []
+        try:
+            ocr = res["overall_ocr_res"]
+            candidates.append(ocr.get("input_img"))
+            dpp = ocr.get("doc_preprocessor_res") or {}
+            candidates.append(dpp.get("output_img"))
+        except Exception:
+            pass
+        for key in ("input_img", "doc_preprocessor_res"):
+            try:
+                v = res[key]
+                candidates.append(v.get("output_img") if isinstance(v, dict) else v)
+            except Exception:
+                pass
+        for img in candidates:
+            if img is not None and hasattr(img, "shape") and len(getattr(img, "shape")) >= 2:
+                h, w = img.shape[:2]
+                if w and h:
+                    return [int(w), int(h)]
+        return None
 
     @classmethod
     def _spatial_text(cls, items: list[tuple[float, float, float, float, str]]) -> str:

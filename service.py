@@ -193,7 +193,7 @@ def submit(
     device: str = Form(""),
     enhance: str = Form("0"),
     overlays: str = Form("0"),
-    boxes: str = Form("0"),              # opt-in: per-line text+box+score in result
+    boxes: str = Form("0"),              # deprecated/no-op: lines are always returned now
 ) -> JSONResponse:
     # NOTE: no readiness gate here. This handler only enqueues the job into the
     # shared store; the OCR runs later in whichever worker's pull loop is ready.
@@ -237,7 +237,7 @@ def submit(
         "device": (device or None),
         "enhance": (enhance == "1"),
         "overlays": (overlays == "1"),
-        "with_lines": (boxes == "1"),
+        "with_lines": True,   # always emit per-line text+box+score (+page_sizes)
         "input_path": str(input_path),
         "key": key.strip() or None,
         "filename": file.filename,
@@ -394,13 +394,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .range input { width: auto; color-scheme: dark; }
   #boxview { margin-bottom: 14px; }
   .boxwrap { position: relative; display: inline-block; max-width: 520px; border: 1px solid #39465a; border-radius: 6px; overflow: hidden; }
-  .boxwrap img { display: block; max-width: 520px; height: auto; }
+  .boxwrap img, .boxwrap canvas { display: block; max-width: 520px; height: auto; }
   .boxsvg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
   .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 50; align-items: center; justify-content: center; padding: 20px; }
   .modalcard { background: #1a212b; border: 1px solid #39465a; border-radius: 10px; padding: 14px; max-width: 92vw; max-height: 92vh; overflow: auto; }
   .modalhead { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
   .modalhead b { font-family: monospace; font-size: 13px; margin-right: auto; word-break: break-all; }
-  .boxwrap.modalwrap, .boxwrap.modalwrap img { max-width: min(80vw, 900px); }
+  .boxwrap.modalwrap, .boxwrap.modalwrap img, .boxwrap.modalwrap canvas { max-width: min(80vw, 900px); }
 </style>
 </head>
 <body>
@@ -473,32 +473,61 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     if (s >= 0.6) return '#e0b97a';
     return '#e07a7a';
   }
-  // Draw one SVG overlay (a rect per line, colored by score) over an <img>.
-  // Shared by the quick-test (in-browser File) and the per-row modal (saved file).
-  function paintBoxes(wrap, img, lines) {
+  // One SVG overlay (a rect per line, colored by score) in a w x h coord space.
+  function makeBoxSvg(w, h, lines) {
     var SVGNS = 'http://www.w3.org/2000/svg';
-    img.onload = function () {
-      var svg = document.createElementNS(SVGNS, 'svg');
-      svg.setAttribute('class', 'boxsvg');
-      svg.setAttribute('viewBox', '0 0 ' + img.naturalWidth + ' ' + img.naturalHeight);
-      svg.setAttribute('preserveAspectRatio', 'none');
-      lines.forEach(function (ln) {
-        var b = ln.box; if (!b || b.length < 4) return;
-        var r = document.createElementNS(SVGNS, 'rect');
-        r.setAttribute('x', b[0]); r.setAttribute('y', b[1]);
-        r.setAttribute('width', Math.max(1, b[2] - b[0]));
-        r.setAttribute('height', Math.max(1, b[3] - b[1]));
-        r.setAttribute('fill', 'none');
-        r.setAttribute('stroke', scoreColor(ln.score));
-        r.setAttribute('stroke-width', Math.max(1, img.naturalWidth / 400));
-        var t = document.createElementNS(SVGNS, 'title');
-        t.textContent = (ln.text || '') + '  [score ' +
-          (ln.score != null ? ln.score.toFixed(3) : '?') + ']';
-        r.appendChild(t); svg.appendChild(r);
-      });
-      wrap.appendChild(svg);
-    };
+    var svg = document.createElementNS(SVGNS, 'svg');
+    svg.setAttribute('class', 'boxsvg');
+    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    svg.setAttribute('preserveAspectRatio', 'none');
+    (lines || []).forEach(function (ln) {
+      var b = ln.box; if (!b || b.length < 4) return;
+      var r = document.createElementNS(SVGNS, 'rect');
+      r.setAttribute('x', b[0]); r.setAttribute('y', b[1]);
+      r.setAttribute('width', Math.max(1, b[2] - b[0]));
+      r.setAttribute('height', Math.max(1, b[3] - b[1]));
+      r.setAttribute('fill', 'none');
+      r.setAttribute('stroke', scoreColor(ln.score));
+      r.setAttribute('stroke-width', Math.max(1, w / 400));
+      var t = document.createElementNS(SVGNS, 'title');
+      t.textContent = (ln.text || '') + '  [score ' +
+        (ln.score != null ? ln.score.toFixed(3) : '?') + ']';
+      r.appendChild(t); svg.appendChild(r);
+    });
+    return svg;
+  }
+  // Overlay on an <img> once it knows its natural size (quick-test + saved image).
+  function paintBoxes(wrap, img, lines) {
+    img.onload = function () { wrap.appendChild(makeBoxSvg(img.naturalWidth, img.naturalHeight, lines)); };
     wrap.appendChild(img);
+  }
+  // Fallback when there is no page raster to draw on: list every line (text+score).
+  function lineList(lines) {
+    var d = document.createElement('div');
+    d.style.cssText = 'max-height:68vh;overflow:auto;font-size:12px';
+    (lines || []).forEach(function (ln) {
+      var row = document.createElement('div');
+      row.style.cssText = 'padding:2px 0;border-bottom:1px solid #242e3b';
+      var sc = document.createElement('span');
+      sc.style.cssText = 'color:' + scoreColor(ln.score) + ';font-family:monospace;margin-right:8px';
+      sc.textContent = (ln.score != null ? ln.score.toFixed(3) : '  ?  ');
+      row.appendChild(sc); row.appendChild(document.createTextNode(ln.text || ''));
+      d.appendChild(row);
+    });
+    return d;
+  }
+  // Lazy-load pdf.js only when a PDF record's boxes are opened.
+  function ensurePdfJs(cb) {
+    if (window.pdfjsLib) { return cb(window.pdfjsLib); }
+    var s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    s.onload = function () {
+      try { window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch (e) {}
+      cb(window.pdfjsLib);
+    };
+    s.onerror = function () { cb(null); };
+    document.head.appendChild(s);
   }
   function boxNote(n) {
     var note = document.createElement('div');
@@ -535,33 +564,79 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     document.getElementById('bm_title').textContent = pid;
     body.textContent = 'loading...';
     document.getElementById('boxmodal').style.display = 'flex';
+    var out = {};
     fetch('/files/' + encodeURIComponent(pid) + '/debug.json', H)
       .then(function (r) { if (!r.ok) throw new Error('debug.json ' + r.status); return r.json(); })
       .then(function (dbg) {
-        var lines = dbg && dbg.output && dbg.output.lines && dbg.output.lines[0];
-        if (!lines || !lines.length) {
-          body.innerHTML = '<div style="color:#e0b97a">No box data saved for this job.<br>' +
-            'Re-run it with a <b>new key</b> and \\u201cshow boxes\\u201d ticked to capture boxes.</div>';
+        out = (dbg && dbg.output) || {};
+        var pages = out.lines || [];
+        var total = pages.reduce(function (n, p) { return n + ((p && p.length) || 0); }, 0);
+        if (!total) {
+          body.innerHTML = '<div style="color:#e0b97a">No box data for this job.<br>' +
+            'Older records (before coordinates were always captured) have none.</div>';
           return;
         }
         return fetch('/files/' + encodeURIComponent(pid) + '/input', H)
           .then(function (r) { if (!r.ok) throw new Error('input ' + r.status); return r.blob(); })
           .then(function (blob) {
-            if (blob.type && blob.type.indexOf('image') !== 0) {
-              body.textContent = 'box overlay is image-only (this input is not an image).';
+            var pages = out.lines || [], sizes = out.page_sizes || [];
+            var isPdf = (blob.type && blob.type.indexOf('pdf') >= 0);
+            if (!isPdf && blob.type && blob.type.indexOf('image') === 0) {   // single image page
+              body.innerHTML = '';
+              var wrap = document.createElement('div'); wrap.className = 'boxwrap modalwrap';
+              var img = document.createElement('img'); img.src = URL.createObjectURL(blob);
+              paintBoxes(wrap, img, pages[0]);
+              body.appendChild(wrap);
+              body.appendChild(boxNote((pages[0] || []).length));
               return;
             }
-            body.innerHTML = '';
-            var wrap = document.createElement('div'); wrap.className = 'boxwrap modalwrap';
-            var img = document.createElement('img'); img.src = URL.createObjectURL(blob);
-            paintBoxes(wrap, img, lines);
-            body.appendChild(wrap);
-            body.appendChild(boxNote(lines.length));
+            if (!isPdf) { renderLineLists(body, pages); return; }           // unknown type -> data only
+            body.textContent = 'rendering PDF...';
+            var buf;
+            return blob.arrayBuffer()
+              .then(function (ab) { buf = ab; return new Promise(function (res) { ensurePdfJs(res); }); })
+              .then(function (pdfjs) {
+                if (!pdfjs) { renderLineLists(body, pages); return; }        // CDN blocked -> data fallback
+                return pdfjs.getDocument({ data: buf }).promise.then(function (doc) {
+                  body.innerHTML = '';
+                  var chain = Promise.resolve();
+                  var mk = function (pn) {
+                    return doc.getPage(pn).then(function (page) {
+                      var pl = pages[pn - 1] || [], sz = sizes[pn - 1];
+                      var vp = page.getViewport({ scale: 1.5 });
+                      var canvas = document.createElement('canvas');
+                      canvas.width = vp.width; canvas.height = vp.height;
+                      var wrap = document.createElement('div');
+                      wrap.className = 'boxwrap modalwrap'; wrap.style.cssText = 'display:block;margin-bottom:10px';
+                      wrap.appendChild(canvas);
+                      // overlay in the OCR raster's coord space (sz) so boxes line up;
+                      // if that size is unknown, show the page's lines as a list instead.
+                      if (sz && sz.length === 2) { wrap.appendChild(makeBoxSvg(sz[0], sz[1], pl)); }
+                      body.appendChild(wrap);
+                      if (!sz) { body.appendChild(lineList(pl)); }
+                      return page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+                    });
+                  };
+                  for (var pn = 1; pn <= doc.numPages; pn++) { (function (n) { chain = chain.then(function () { return mk(n); }); })(pn); }
+                  return chain.then(function () { body.appendChild(boxNote(total)); });
+                });
+              });
           });
       })
       .catch(function (e) {
         body.innerHTML = '<div style="color:#e07a7a">could not load boxes: ' + esc(e.message) + '</div>';
       });
+  }
+  function renderLineLists(body, pages) {
+    body.innerHTML = '';
+    (pages || []).forEach(function (pl, i) {
+      if ((pages || []).length > 1) {
+        var h = document.createElement('div');
+        h.style.cssText = 'color:#8b98a9;margin:8px 0 2px'; h.textContent = 'page ' + (i + 1);
+        body.appendChild(h);
+      }
+      body.appendChild(lineList(pl));
+    });
   }
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeBoxes(); });
 
@@ -674,7 +749,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
             + '<button onclick="openDebug(\\'' + esc(j.process_id) + '\\')">debug</button> '
             + (j.has_boxes
                 ? '<button onclick="openBoxes(\\'' + esc(j.process_id) + '\\')">box</button>'
-                : '<button disabled title="no box data \\u2014 re-run with a new key + \\u201cshow boxes\\u201d">box</button>')
+                : '<button disabled title="no box data (older record \\u2014 before coordinates were always captured)">box</button>')
             + '</td></tr>';
         });
         document.getElementById('rows').innerHTML =
