@@ -9,10 +9,10 @@
 
 .EXAMPLE
   # first machine
-  powershell -ExecutionPolicy Bypass -File .\setup_tunnel.ps1 -Hostname ocr.voiceaccountant.com
+  powershell -ExecutionPolicy Bypass -File .\setup\setup_tunnel.ps1 -Hostname ocr.voiceaccountant.com
 
   # a second machine / second subdomain, same Cloudflare account
-  powershell -ExecutionPolicy Bypass -File .\setup_tunnel.ps1 -Hostname ocr2.voiceaccountant.com -TunnelName ocr2-tunnel
+  powershell -ExecutionPolicy Bypass -File .\setup\setup_tunnel.ps1 -Hostname ocr2.voiceaccountant.com -TunnelName ocr2-tunnel
 
   Then run it:  cloudflared tunnel run <TunnelName>   (or install_autostart.ps1 -TunnelName <TunnelName>)
 #>
@@ -75,4 +75,4 @@ ingress:
 Set-Content -Path (Join-Path $cfHome "config.yml") -Value $config -Encoding UTF8
 Write-Host "`nWrote $cfHome\config.yml -> $Hostname => http://127.0.0.1:$Port" -ForegroundColor Green
 Write-Host "Run it:   & `"$cf`" tunnel run $TunnelName"
-Write-Host "Autostart: powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1 -TunnelName $TunnelName"
+Write-Host "Autostart: powershell -ExecutionPolicy Bypass -File .\setup\install_autostart.ps1 -TunnelName $TunnelName"

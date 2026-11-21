@@ -103,10 +103,6 @@ class OCRService:
 
     # -- loading -----------------------------------------------------------
 
-    def is_loaded(self, tier: str = "server", device: Optional[str] = None) -> bool:
-        eff, _ = self._resolve_device(device)
-        return (tier, eff) in self._pipelines
-
     def load_meta(self) -> dict:
         return self._load_meta
 
@@ -598,7 +594,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 app = FastAPI(title="PaddleOCR prototype")
 service = OCRService()
 
-JOBS_DIR = Path(__file__).parent / "output"
+JOBS_DIR = Path(__file__).resolve().parent.parent / "output"
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf", ".bmp", ".webp"}
 _load_state = {"state": "loading", "error": None}
 

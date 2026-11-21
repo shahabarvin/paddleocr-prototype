@@ -1,6 +1,6 @@
 """Launch the OCR service as N worker processes on one endpoint.
 
-    python serve.py
+    python src/serve.py
 
 Each worker loads its own GPU pipeline and runs a pull loop; they share seats,
 the job queue and results through state.db (SQLite). One card fits ~2 server

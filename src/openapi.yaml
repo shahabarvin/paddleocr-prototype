@@ -11,7 +11,7 @@ info:
     ## Auth
     Every `/api/*` and `/files/*` call needs `Authorization: Bearer <token>`.
     Store the token in config/env (e.g. `config('services.ocr.token')`) — never
-    hardcode or log it. Tokens are issued/revoked server-side (keys.py); a request
+    hardcode or log it. Tokens are issued/revoked server-side (src/keys.py); a request
     without a valid token gets `401`. `GET /healthz` is public. Interactive docs
     with a Try-it-out tester are at `GET /docs` (Swagger UI).
     Base URL: `https://ocr.voiceaccountant.com`.
@@ -47,8 +47,6 @@ info:
     - `enhance`: `1` for scans/photos/receipts (denoise+contrast, ~40% slower),
       `0` for clean digital PDFs.
     - `overlays`: keep `0` in production (`1` only saves debug overlay PNGs).
-    - `boxes`: deprecated / no-op. `result.lines` (per-line text, box and score) is
-      now always returned, so you no longer need to ask for it.
 
     ## Using the result
     - `result.markdown` — layout-aware markdown; the main text to feed your LLM.
@@ -69,7 +67,7 @@ info:
     - `401` — missing/invalid/revoked token.
     - `429` — all seats busy -> back off + retry.
     - `503` — warming up or model-load error -> retry shortly.
-    - `404` on GET — unknown/expired `process_id` (results kept ~1 h) -> re-submit.
+    - `404` on GET — unknown/expired `process_id` (results kept ~7 days) -> re-submit.
     - `failed` status — OCR error (`error` field); safe to retry with same `key`.
 
     ## Example — a Laravel job
@@ -153,11 +151,6 @@ paths:
                   enum: ["0", "1"]
                   default: "0"
                   description: "1 = also save detection overlay PNGs (retrievable via /files/...)."
-                boxes:
-                  type: string
-                  enum: ["0", "1"]
-                  default: "0"
-                  description: "Deprecated / no-op. `result.lines` (+ `result.page_sizes`) is always returned now, so this flag no longer changes anything."
       responses:
         "202":
           description: Accepted. The job was admitted (`started`) or is already running (`in_progress`).
@@ -330,7 +323,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: "Send Authorization: Bearer <token>. Tokens are managed with keys.py on the server."
+      description: "Send Authorization: Bearer <token>. Tokens are managed with src/keys.py on the server."
   schemas:
     SubmitAccepted:
       type: object

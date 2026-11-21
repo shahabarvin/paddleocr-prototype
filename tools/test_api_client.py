@@ -1,7 +1,7 @@
 """Realistic client test (what Laravel does): submit a file with a bearer token,
 poll by process_id, print the result. Token + base URL come from env:
 
-    OCR_TOKEN=<token> OCR_BASE=https://ocr.voiceaccountant.com python test_api_client.py
+    OCR_TOKEN=<token> OCR_BASE=https://ocr.voiceaccountant.com python tools/test_api_client.py   (from the repo root)
 """
 import os
 import sys

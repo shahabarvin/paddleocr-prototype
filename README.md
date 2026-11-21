@@ -1,168 +1,232 @@
-# PaddleOCR service — layout-aware OCR API for LLM preprocessing
+# PaddleOCR service — layout-aware OCR API
 
 A GPU-accelerated OCR service built on PaddleOCR **PP-StructureV3**. It turns
-document images/PDFs into layout-aware **markdown** + spatial **plain text**, as a
-preprocessing step before an LLM. Ships as two parts over one shared core:
+document images and PDFs into layout-aware **markdown**, spatial **plain text**
+and per-line **coordinates**, as a preprocessing step before an LLM. A backend
+(here: a Laravel queue) submits a file, gets a job id, and polls for the result.
 
-- **`service.py`** — the production API: multi-worker, seat-limited,
-  bearer-authenticated, asynchronous (submit → poll). This is what a backend
-  (e.g. a Laravel queue) calls. Deployed here behind a Cloudflare Tunnel at
-  **`https://ocr.voiceaccountant.com`**.
-- **`app.py`** — a local eval UI (upload a file in the browser; see markdown,
-  overlays and timings). For inspecting quality — not the production path.
+Production instance: **`https://ocr.voiceaccountant.com`** (behind a Cloudflare
+Tunnel). Windows only; the scripts are PowerShell.
 
-Both are thin layers over the framework-agnostic `OCRService` core in `app.py`.
+- [Set up a machine from scratch](#set-up-a-machine-from-scratch)
+- [Day-to-day control](#day-to-day-control)
+- [Using the API](#using-the-api)
+- [Configuration](#configuration)
+- [Repository layout](#repository-layout)
 
-## Setup — one command
+## Set up a machine from scratch
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1          # venv + deps + GPU build + health check
-powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Warm    # also download/warm the models (~1-2 GB)
-powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Check   # doctor only (installs nothing)
-```
+Follow these in order. Steps 1–4 give you a working local service; 5–7 put it on
+the internet and make it survive reboots.
 
-`setup.ps1` needs **Python 3.12** on PATH (`py -3.12`). It creates the venv,
-installs dependencies, auto-detects the GPU and installs `paddlepaddle-gpu` (cu129
-by default; `-Cuda cu126`/`cu118` or `-Cpu` to override), then runs a health
-check. Re-running is safe and doubles as a **fixer**.
+### 1. Install the prerequisites
 
-The **`-Check` doctor** verifies Python, packages, GPU/CUDA, models, API keys,
-cloudflared, the autostart tasks and the live service — and prints exactly what to
-fix. So a fresh Windows install can be brought up (or debugged) **without AI**.
+The scripts do **not** install these:
 
-<details><summary>Manual setup (what <code>setup.ps1</code> automates)</summary>
-
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-# GPU: replace the CPU wheel (CUDA libs come bundled as pip deps, no toolkit needed).
-# cu118 / cu126 / cu129 by GPU generation; Blackwell (RTX 50-series) needs cu129.
-.venv\Scripts\python -m pip uninstall -y paddlepaddle
-.venv\Scripts\python -m pip install "paddlepaddle-gpu==3.3.1" `
-  -i https://www.paddlepaddle.org.cn/packages/stable/cu129/ --extra-index-url https://pypi.org/simple
-```
-</details>
-
-The first ever start downloads the models (~1–2 GB) into
-`~/.paddlex/official_models` (counted as "model load", never as inference).
-Inference runs on GPU by default; a GPU request falls back to CPU automatically
-if no CUDA build is present.
-
-## Run the production API
-
-```powershell
-.venv\Scripts\python serve.py      # 2 workers on http://127.0.0.1:8000
-```
-
-- **Two worker processes**, each with its own GPU pipeline. A shared SQLite store
-  (`state.db`, WAL) coordinates seats + a job queue + results — **no Redis needed**
-  on a single machine.
-- **Async + seat-limited:** submit returns a `process_id` immediately; at most
-  `OCR_SEATS` (default **3**) jobs run at once (excess → `429`), then poll for the
-  result.
-- **Idempotent:** pass a stable `key`; re-submits return the existing job / cached
-  result — safe for queue retries.
-- **Authenticated:** bearer token on all `/api/*` endpoints (see *Auth*).
-
-### Endpoints
-
-`POST /api/ocr` — multipart form:
-
-| field | default | notes |
+| What | How | Needed for |
 |---|---|---|
-| `file` | — | jpg/png/pdf/bmp/webp. Max 20 MB (`413` if larger). |
-| `key` | hash(file) | **idempotency key** — pass your job/document id. Re-runs never start a second OCR. |
-| `model` | `server` | `server` (quality) or `mobile` (fast) |
-| `device` | gpu | `gpu` / `cpu` |
-| `enhance` | `0` | `1` = denoise+contrast pre-pass for degraded scans |
-| `overlays` | `0` | `1` = save detection overlay PNGs |
+| Python **3.12** | python.org installer (must provide `py -3.12`) | everything |
+| Git | `winget install Git.Git` | cloning |
+| NVIDIA driver | a current driver for your card | GPU speed (without it the service runs on CPU, much slower) |
+| cloudflared | `winget install --id Cloudflare.cloudflared` | step 5 only |
 
-| Response | HTTP | Body |
+### 2. Clone and install
+
+```powershell
+git clone https://github.com/shahabarvin/paddleocr-prototype
+cd paddleocr-prototype
+powershell -ExecutionPolicy Bypass -File .\setup\setup.ps1 -Warm
+```
+
+This creates `.venv`, installs the dependencies, detects the GPU and installs the
+matching `paddlepaddle-gpu` build, downloads the models (~1–2 GB, into
+`~/.paddlex/official_models`) and finishes with a health check. It takes a while
+the first time. Re-running it is safe and repairs a broken install.
+
+Options: `-Cuda cu126` or `-Cuda cu118` for older GPUs (default `cu129`, required
+for RTX 50-series), `-Cpu` to force CPU.
+
+### 3. Create an API key
+
+```powershell
+.venv\Scripts\python src\keys.py create "laravel-prod"
+```
+
+The token is printed **once** — copy it now. Until a key exists every API call
+returns `401`.
+
+### 4. Try it locally
+
+```powershell
+.venv\Scripts\python src\serve.py
+```
+
+Open <http://127.0.0.1:8000/dashboard>, paste the token, and upload a file with
+**Quick test**. Stop it with Ctrl+C before continuing.
+
+### 5. Connect a public hostname (Cloudflare Tunnel)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup\setup_tunnel.ps1 -Hostname ocr2.voiceaccountant.com -TunnelName ocr2-tunnel
+```
+
+A browser opens once to log in to Cloudflare and pick the domain. The script then
+creates the tunnel, adds the DNS record and writes `~/.cloudflared/config.yml`.
+Any subdomain of a domain on the account works, at no cost. The service itself
+keeps listening on `127.0.0.1` only; the tunnel is the only way in.
+
+> **If this machine already runs another Cloudflare tunnel, do not run this
+> script.** It overwrites `~/.cloudflared/config.yml` and the existing tunnel
+> stops working. Create the second tunnel by hand with its own config file.
+
+### 6. Start at boot
+
+In an **Administrator** PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup\install_autostart.ps1 -TunnelName ocr2-tunnel
+```
+
+This registers three Windows scheduled tasks that run without anyone logged in:
+`OCR-Server` (the service), `Cloudflare-Tunnel`, and `OCR-Watchdog` (every 3
+minutes, restarts the service if it is down). The tasks store the folder's full
+path — if you move the repo, run this step again.
+
+Then double-click **`manage\Start.cmd`** to start everything now.
+
+### 7. Verify
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup\setup.ps1 -Check
+```
+
+The doctor checks Python, packages, GPU, models, API keys, cloudflared, the
+scheduled tasks and the live service, and says what to fix. Finally open
+`https://<your-hostname>/healthz` — it should return `{"status":"ok","ready":true}`.
+
+Give the client the hostname and the token from step 3. Each machine has its own
+keys, queue and results; two machines do not share anything.
+
+## Day-to-day control
+
+No command line needed — double-click a file in [`manage\`](manage/):
+
+| File | What it does |
+|---|---|
+| `Status.cmd` | Is it running, how many workers, GPU memory in use |
+| `Start.cmd` | Start the service |
+| `Stop.cmd` | Turn it off until you click Start (or the PC reboots) |
+| `Restart.cmd` | Restart the service and the tunnel |
+| `Set-Workers.cmd` | Change how many documents are processed in parallel |
+| `Set-Cleanup.cmd` | Choose after how many days old job files are deleted (0 = never) |
+| `Dashboard.cmd` | Open the live dashboard |
+
+All but `Status` and `Dashboard` ask for administrator permission, and the two
+`Set-…` files restart the service to apply the change. The service is
+run by Windows, so nothing has to stay open.
+
+The **dashboard** (`/dashboard`) shows seats, the queue and recent jobs, filters
+by time, and for each job opens the input file, the result, the debug record and
+a view of every recognized line drawn over the page.
+
+## Using the API
+
+Full contract and a copy-paste Laravel example: [`src/openapi.yaml`](src/openapi.yaml),
+also served at `/openapi.yaml` and browsable at `/docs`. In short:
+
+```
+POST /api/ocr            multipart: file, key        -> 202 {status:"started", process_id}
+GET  /api/ocr/{id}                                   -> 202 while running, 200 {status:"done", result}
+```
+
+Every `/api/*` and `/files/*` call needs `Authorization: Bearer <token>`.
+`/healthz`, `/docs`, `/openapi.yaml` and the dashboard page are public.
+
+| Form field | Default | Notes |
 |---|---|---|
-| admitted | 202 | `{status:"started", process_id}` |
-| same job running | 202 | `{status:"in_progress", process_id}` |
-| same job finished | 200 | `{status:"done", process_id, result}` |
-| all seats busy | 429 | `{status:"no_seat"}` + `Retry-After` |
+| `file` | — | jpg, png, pdf, bmp, webp. Max 20 MB (`413` if larger). |
+| `key` | hash of the file | Idempotency key — pass your job or document id. A re-submit returns the existing job or its result, never a second OCR run. |
+| `model` | `server` | `server` (quality) or `mobile` (faster, no table or formula structure) |
+| `device` | `gpu` | `gpu` or `cpu` |
+| `enhance` | `0` | `1` = denoise and contrast pre-pass for faded scans (~40% slower) |
+| `overlays` | `0` | `1` = also save detection overlay images |
 
-`GET /api/ocr/{process_id}` → `200 {status:"done", result}` / `{status:"failed", error}`, or `202` while queued/processing.
-`GET /api/status` → worker id + live seat usage.
+**Result fields**
 
-### Interactive docs
+- `markdown` — layout-aware markdown; the main text to feed an LLM. If the
+  structured markdown drops a value, the service falls back to the complete
+  spatial text, so no recognized line is lost.
+- `layout_text` — plain text on a monospace grid; better for receipts and forms
+  where columns and line breaks matter.
+- `lines` — per page, every recognized line as `{text, box:[x1,y1,x2,y2], score}`.
+- `page_sizes` — per page `[width, height]` of the raster the boxes refer to.
 
-- **`GET /docs`** — Swagger UI: browse + **Try-it-out** tester + **Authorize**
-  button for the bearer token.
-- **`GET /openapi.yaml`** — the full spec (also embeds a complete Laravel
-  integration guide with a copy-paste example).
-- `GET /healthz` — public liveness probe.
+**Seats and workers.** `OCR_WORKERS` processes run OCR in parallel; `OCR_SEATS`
+is how many jobs the service accepts at once, running or waiting. With the
+defaults (2 workers, 3 seats) two jobs run, a third waits, and a fourth gets `429`
+with `Retry-After` — the client backs off and retries.
 
-Hand `https://ocr.voiceaccountant.com/openapi.yaml` (or `/docs`) to the client.
+**Retention.** Results are kept about 7 days; after that `GET` returns `404` and
+the client re-submits. The job files on disk (`output/<date>/<id>/`: input,
+result, debug record) are kept forever by default. To delete them automatically
+after N days, double-click `manage\Set-Cleanup.cmd` (or set
+`OCR_FILES_KEEP_DAYS`); the service then removes old folders about once an hour.
+Choosing fewer days than `OCR_TTL_DAYS` means a job can still be listed on the
+dashboard after its files are gone.
 
-### Auth (bearer tokens)
-
-All `/api/*` and `/files/*` endpoints require `Authorization: Bearer <token>`
-(`/healthz`, `/docs`, `/openapi.yaml` are public). Tokens are managed on the
-server with [keys.py](keys.py) — multiple keys, each individually revocable, no
-restart needed:
-
-```powershell
-.venv\Scripts\python keys.py create "laravel-prod"   # prints the token ONCE
-.venv\Scripts\python keys.py list                     # id, active/revoked, label
-.venv\Scripts\python keys.py revoke <id>              # kill a key in ~seconds
-```
-
-Only SHA-256 hashes are stored in `api_keys.json` (git-ignored); the plaintext
-token is shown only at creation. With auth on and no keys yet, every request is
-`401` until you create one.
-
-### Config (env)
-
-`OCR_WORKERS` (2) · `OCR_SEATS` (3) · `OCR_HOST` (127.0.0.1) · `OCR_PORT` (8000) ·
-`OCR_DEVICE` (gpu) · `OCR_DB` (state.db) · `OCR_AUTH` (on; `off` for local dev) ·
-`OCR_KEYS_FILE` (api_keys.json) · `OCR_MAX_UPLOAD_MB` (20) · `OCR_DEBUG` (1; writes
-`output/<process_id>/debug.json` with the request input + output — `0` to disable).
-
-## Deployment & portability
-
-Exposed to the internet via **Cloudflare Tunnel** — no port-forwarding; the
-service stays bound to `127.0.0.1` (the tunnel is the only ingress). One command
-connects a machine to a subdomain on your Cloudflare account (logs in, creates the
-tunnel, adds the DNS route, writes `~/.cloudflared/config.yml`):
+**Keys**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\setup_tunnel.ps1 -Hostname ocr.voiceaccountant.com
+.venv\Scripts\python src\keys.py create "label"   # prints the token once
+.venv\Scripts\python src\keys.py list
+.venv\Scripts\python src\keys.py revoke <id>      # takes effect in seconds, no restart
 ```
 
-**Auto-start on boot** (survives reboots headlessly, no login required) — run once
-in an **elevated** PowerShell:
+Only SHA-256 hashes are stored (`data/api_keys.json`).
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
+## Configuration
+
+Environment variables, read at start-up. Put machine-specific values in
+`data\settings.local.cmd` (for example `set OCR_WORKERS=1`) — `Set-Workers.cmd`
+and `Set-Cleanup.cmd` write that file for you — then restart.
+
+| Variable | Default | |
+|---|---|---|
+| `OCR_WORKERS` | 2 | parallel OCR processes; each loads its own copy of the models |
+| `OCR_SEATS` | 3 | jobs accepted at once |
+| `OCR_HOST` / `OCR_PORT` | 127.0.0.1 / 8000 | |
+| `OCR_DEVICE` | gpu | falls back to CPU if no CUDA build is present |
+| `OCR_TTL_DAYS` | 7 | how long results are kept |
+| `OCR_FILES_KEEP_DAYS` | 0 | delete job files older than this many days; 0 = never |
+| `OCR_MAX_UPLOAD_MB` | 20 | |
+| `OCR_AUTH` | on | `off` for local development only |
+| `OCR_DEBUG` | 1 | writes `debug.json` (request + result) next to each job; `0` disables |
+| `OCR_DB` / `OCR_KEYS_FILE` | `data/state.db` / `data/api_keys.json` | |
+
+**GPU memory.** Measured on an RTX 5060 Ti (16 GB) with real one-page documents:
+each worker settles at 5–7 GB after it has processed large pages, so two workers
+hold about 12 GB. A second worker added about 19% throughput while making each
+document about 45% slower when both were busy (median 1.1 s alone, 1.6 s
+together). If the GPU is shared with something else, one worker is the better
+trade.
+
+## Repository layout
+
 ```
-
-It registers three Windows scheduled tasks: **`OCR-Server`** (runs
-[start_ocr.cmd](start_ocr.cmd) → `serve.py`), **`Cloudflare-Tunnel`** (runs the
-tunnel), and **`OCR-Watchdog`** (every 3 min: runs [restart.ps1](restart.ps1) if
-the service is down — self-healing without a reboot). All scripts derive their
-paths at runtime, so they work after re-cloning anywhere.
-
-Recovery is automatic: a **reboot/power-cycle** starts the tasks at boot, and the
-**watchdog** brings the service back within ~3 min if it ever crashes. To recover
-immediately by hand, run [restart.ps1](restart.ps1).
-
-### A second machine / subdomain
-
-Same Cloudflare account, a new subdomain, a separate tunnel — no code changes:
-
-```powershell
-git clone https://github.com/shahabarvin/paddleocr-prototype && cd paddleocr-prototype
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
-powershell -ExecutionPolicy Bypass -File .\setup_tunnel.ps1 -Hostname ocr2.voiceaccountant.com -TunnelName ocr2-tunnel
-.venv\Scripts\python keys.py create "laravel-prod"
-powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1 -TunnelName ocr2-tunnel   # elevated
+src/      the application
+            app.py       OCRService core (no web imports) + a local eval UI
+            service.py   the production API and dashboard
+            serve.py     multi-worker launcher
+            store.py     SQLite store: seats, queue, dedup, results
+            auth.py, keys.py   bearer keys
+            openapi.yaml       API contract + Laravel guide
+setup/    one-time install: setup.ps1, setup_tunnel.ps1, install_autostart.ps1
+manage/   running it: start_ocr.cmd, restart.ps1, watchdog.ps1, the double-click files
+tools/    manual scripts, run from the repo root
+tests/    pytest suite
+data/     machine-local state (keys, database, settings) — not in git
+output/   job files — not in git
 ```
-
-Security: bearer auth is the app-level guard; optionally add **Cloudflare Access**
-(service token) at the edge for a second layer before traffic reaches the origin.
 
 ## Tests
 
@@ -171,67 +235,18 @@ Security: bearer auth is the app-level guard; optionally add **Cloudflare Access
 .venv\Scripts\python -m pytest
 ```
 
-Unit tests (no GPU) cover the SQLite store (seats, dedup, stale-reclaim, TTL),
-bearer auth + key rotation, and the OCR helpers (device fallback, enhance, text
-normalization). An API suite drives the real FastAPI endpoints (auth, `413` size
-limit, async submit→poll, idempotency, public `/docs` + `/openapi.yaml`) with the
-GPU work mocked — so the whole suite runs in ~2 s on any machine.
-
-## Laravel integration
-
-The full behavioral guide (async flow, idempotency, `429` backoff, queue tuning,
-which result field to use) plus a copy-paste PHP example live in
-**[openapi.yaml](openapi.yaml)** (`info.description`) — hand that file or the
-`/openapi.yaml` URL to the client. In short: send `Authorization: Bearer <token>`,
-`POST /api/ocr` with your job id as `key`, then poll `GET /api/ocr/{id}`; set the
-queue worker concurrency ≈ 3 and job `retry_after` > 120 s.
-
-## Performance (RTX 5060 Ti, 16 GB — measured)
-
-| Metric | Value |
-|---|---|
-| Model load at startup (per worker) | ~10–25 s |
-| Steady-state inference (server tier) | ~0.5–0.75 s/page |
-| Throughput — 1 worker | ~2.2 img/s |
-| Throughput — **2 workers** | **~3.5 img/s** (both pipelines, split ~50/50) |
-| Throughput — 3 / 4 workers | ~4.1 / ~4.3 img/s (diminishing) |
-| `enhance=1` | ~40 % slower |
-
-The single GPU is the ceiling (two CUDA contexts time-slice one card), so beyond
-2 workers throughput barely moves. More throughput = another GPU (~linear), the
-`mobile` tier (fewer models), or batching. VRAM/power headroom does **not**
-translate to throughput — the card is compute/launch-bound, not memory-bound.
+No GPU needed: the suite covers the store, auth and key rotation, the OCR
+helpers, and the real FastAPI endpoints with the model work mocked. It runs in a
+couple of seconds.
 
 ## OCR quality notes
 
-- **`markdown` vs `layout_text`:** use `result.markdown` for
-  reports/papers/tables; use `result.layout_text` (plain text on a monospace
-  grid) for receipts/forms/tickets where columns and line-breaks matter.
-- **`enhance=1`** (denoise + CLAHE + upscale) helps faded/crumpled/smudged scans.
-  On a degraded receipt it recovered 29/42 known tokens vs 27 raw; binarization
-  (23), detection-threshold lowering (24) and unwarping (21) all measured
-  *worse*, so they are intentionally not applied.
-- **Model tiers:** `server` (quality — large layout model, table structure,
-  formula recognition) vs `mobile` (faster; no table/formula structure). Both stay
-  cached in memory, so switching is free.
-- **Known recognition limits** (rec-model behavior, best fixed downstream by the
-  LLM): currency symbols tight against digits (e.g. `₹360.00` — see
-  [rupee_test.py](rupee_test.py)), and occasional dropped intra-word spaces.
-  Decorative separator lines are filtered out of both text views.
-
-## The eval UI (`app.py`)
-
-```powershell
-.venv\Scripts\python app.py        # http://127.0.0.1:8000  (browser UI)
-```
-
-Upload a JPG/PNG/PDF, pick tier + device + enhance, and inspect the markdown,
-layout text, rendered preview, and detection overlays with a timing breakdown.
-Quality inspection only — no auth, no seats. Don't run it and `serve.py` on the
-same port at once.
-
-## Reusable core
-
-`OCRService` in [app.py](app.py) is framework-agnostic (no web imports):
-`load()` once per process, `process(path, tier=, device=, enhance=)` per
-document → a JSON-serializable dict. Both the API and the eval UI wrap it.
+- **`enhance=1`** helps faded, crumpled or smudged scans. It garbles clean scans,
+  so the service runs the original first and only falls back to the enhanced
+  version when the original yields almost no text.
+- **Known recognition limits**, best handled downstream by the LLM: currency
+  symbols tight against digits (for example `₹360.00`) and occasional dropped
+  spaces inside words. Decorative separator lines are filtered out.
+- **Eval UI.** `.venv\Scripts\python src\app.py` serves a browser page for
+  inspecting one file's markdown, layout text and overlays with timings. No
+  auth, no queue; do not run it on the same port as the service.

@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
   Register three scheduled tasks (no login required):
-    OCR-Server        -> start_ocr.cmd (the multi-worker OCR service)  [at boot]
+    OCR-Server        -> manage\start_ocr.cmd (the multi-worker OCR service)  [at boot]
     Cloudflare-Tunnel -> cloudflared tunnel run <TunnelName>           [at boot]
-    OCR-Watchdog      -> watchdog.ps1 (restart if down)               [every 3 min]
+    OCR-Watchdog      -> manage\watchdog.ps1 (restart if down)               [every 3 min]
 
   Portable: all paths are derived at runtime, so it works after re-cloning to a
   new machine/folder. Run ONCE in an ELEVATED (Administrator) PowerShell:
 
-    powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
-    powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1 -TunnelName ocr2-tunnel
+    powershell -ExecutionPolicy Bypass -File .\setup\install_autostart.ps1
+    powershell -ExecutionPolicy Bypass -File .\setup\install_autostart.ps1 -TunnelName ocr2-tunnel
 
   Remove with:
     Unregister-ScheduledTask OCR-Server,Cloudflare-Tunnel,OCR-Watchdog -Confirm:$false
@@ -19,7 +19,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-$proj = $PSScriptRoot
+$proj = Split-Path $PSScriptRoot -Parent   # repo root (this file lives in setup\)
 $user = "$env:USERDOMAIN\$env:USERNAME"
 
 # locate cloudflared
@@ -39,7 +39,7 @@ $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGo
     -MultipleInstances IgnoreNew
 
 Register-ScheduledTask -TaskName "OCR-Server" -Force -Principal $principal -Trigger $trigger -Settings $settings `
-    -Action (New-ScheduledTaskAction -Execute (Join-Path $proj "start_ocr.cmd") -WorkingDirectory $proj) `
+    -Action (New-ScheduledTaskAction -Execute (Join-Path $proj "manage\start_ocr.cmd") -WorkingDirectory $proj) `
     -Description "PaddleOCR multi-worker service (127.0.0.1:8000)"
 
 Register-ScheduledTask -TaskName "Cloudflare-Tunnel" -Force -Principal $principal -Trigger $trigger -Settings $settings `
@@ -51,7 +51,7 @@ $wtrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
     -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 3650)
 Register-ScheduledTask -TaskName "OCR-Watchdog" -Force -Principal $principal -Trigger $wtrigger -Settings $settings `
     -Action (New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument ("-ExecutionPolicy Bypass -NonInteractive -File `"" + (Join-Path $proj "watchdog.ps1") + "`"")) `
+        -Argument ("-ExecutionPolicy Bypass -NonInteractive -File `"" + (Join-Path $proj "manage\watchdog.ps1") + "`"")) `
     -Description "Restart the OCR service if it goes down (health check every 3 min)"
 
 Write-Host "`nRegistered:" -ForegroundColor Green

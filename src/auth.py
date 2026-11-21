@@ -16,7 +16,9 @@ import os
 import threading
 from pathlib import Path
 
-KEYS_FILE = Path(os.environ.get("OCR_KEYS_FILE", Path(__file__).parent / "api_keys.json"))
+# machine-local data lives in <repo>/data (git-ignored), code in <repo>/src
+KEYS_FILE = Path(os.environ.get(
+    "OCR_KEYS_FILE", Path(__file__).resolve().parent.parent / "data" / "api_keys.json"))
 
 _cache = {"mtime": None, "hashes": set()}
 _lock = threading.Lock()

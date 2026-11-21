@@ -1,9 +1,9 @@
 """Manage API bearer keys for the OCR service.
 
-    python keys.py create "laravel-prod"   # make a key, prints the token ONCE
-    python keys.py list                     # show keys (active/revoked)
-    python keys.py revoke <id>              # disable a key (takes effect in seconds)
-    python keys.py delete <id>              # remove a key row entirely
+    python src/keys.py create "laravel-prod"   # make a key, prints the token ONCE
+    python src/keys.py list                     # show keys (active/revoked)
+    python src/keys.py revoke <id>              # disable a key (takes effect in seconds)
+    python src/keys.py delete <id>              # remove a key row entirely
 
 Only the SHA-256 hash of each token is stored in api_keys.json; the plaintext
 token is shown exactly once at creation. Revocation needs no server restart.
@@ -19,7 +19,9 @@ from pathlib import Path
 
 from auth import token_hash
 
-KEYS_FILE = Path(os.environ.get("OCR_KEYS_FILE", Path(__file__).parent / "api_keys.json"))
+# machine-local data lives in <repo>/data (git-ignored), code in <repo>/src
+KEYS_FILE = Path(os.environ.get(
+    "OCR_KEYS_FILE", Path(__file__).resolve().parent.parent / "data" / "api_keys.json"))
 
 
 def _load() -> dict:
@@ -29,6 +31,7 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
+    KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
     KEYS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
@@ -55,7 +58,7 @@ def create(label: str) -> None:
 def list_keys() -> None:
     keys = _load()["keys"]
     if not keys:
-        print("(no keys yet — run: python keys.py create \"label\")")
+        print("(no keys yet — run: python src/keys.py create \"label\")")
         return
     for k in keys:
         state = "ACTIVE " if k.get("active") else "revoked"

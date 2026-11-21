@@ -16,10 +16,16 @@
   this elevated automatically.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\restart.ps1
+  powershell -ExecutionPolicy Bypass -File .\manage\restart.ps1
 #>
+param(
+  # Stop the OCR service and leave it stopped (the tunnel keeps running).
+  # Used by manage\Stop.cmd; the watchdog must be disabled too or it restarts it.
+  [switch]$StopOnly
+)
 $ErrorActionPreference = "Continue"
 $port = [int]($env:OCR_PORT); if (-not $port) { $port = 8000 }
+$tasks = if ($StopOnly) { @("OCR-Server") } else { @("OCR-Server","Cloudflare-Tunnel") }
 
 function Get-PortOwners([int]$port) {
   @(Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |
@@ -68,7 +74,7 @@ function Invoke-OcrFlush([int]$port) {
 }
 
 Write-Host "Stopping tasks..." -ForegroundColor Cyan
-foreach ($t in "OCR-Server","Cloudflare-Tunnel") { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue }
+foreach ($t in $tasks) { Stop-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue }
 Start-Sleep 2
 
 Write-Host "Flushing stale OCR workers..." -ForegroundColor Cyan
@@ -87,8 +93,14 @@ for ($k = 0; $k -lt 4; $k++) {
   Start-Sleep 2
 }
 
+if ($StopOnly) {
+  if (Get-PortOwners $port) { Write-Host "  port :$port is still held -- run elevated" -ForegroundColor Yellow }
+  else { Write-Host "  STOPPED: nothing is listening on :$port" -ForegroundColor Green }
+  return
+}
+
 Write-Host "Starting tasks..." -ForegroundColor Cyan
-foreach ($t in "OCR-Server","Cloudflare-Tunnel") { Start-ScheduledTask -TaskName $t }
+foreach ($t in $tasks) { Start-ScheduledTask -TaskName $t }
 
 Write-Host "Waiting for the service to warm up..." -ForegroundColor Cyan
 $ready = $false
@@ -101,7 +113,7 @@ for ($i = 0; $i -lt 30; $i++) {
     }
   } catch {}
 }
-if (-not $ready) { Write-Host "  still not ready -- check: powershell -File .\setup.ps1 -Check" -ForegroundColor Yellow }
+if (-not $ready) { Write-Host "  still not ready -- check: powershell -File .\setup\setup.ps1 -Check" -ForegroundColor Yellow }
 
 try {
   $p = Invoke-WebRequest "https://ocr.voiceaccountant.com/healthz" -UseBasicParsing -TimeoutSec 20

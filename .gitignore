@@ -18,16 +18,5 @@ samples/
 # pytest
 .pytest_cache/
 
-# shared-state DB for the multi-worker service (runtime)
-state.db
-state.db-wal
-state.db-shm
-
-# API bearer keys (hashes, but keep out of the repo)
-api_keys.json
-
-# auto-generated secret (from a webui dependency) — never commit
-.webui_secret_key
-
-# DNS migration snapshots (may contain infra detail)
-dns_snapshot*.txt
+# machine-local state: API key hashes, the shared SQLite DB, local settings
+data/

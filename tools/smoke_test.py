@@ -1,6 +1,6 @@
 """End-to-end smoke test: generates a synthetic document image (heading,
 two columns, table), runs it through OCRService, prints timings + markdown.
-First run triggers the model download. Usage: python smoke_test.py
+First run triggers the model download. Usage (from the repo root): python tools/smoke_test.py
 """
 from pathlib import Path
 
@@ -66,9 +66,12 @@ def make_test_image(path: Path) -> None:
 
 
 if __name__ == "__main__":
+    import sys
+
+    here = Path(__file__).resolve().parent.parent      # repo root
+    sys.path.insert(0, str(here / "src"))
     from app import OCRService
 
-    here = Path(__file__).parent
     test_img = here / "output" / "smoke" / "test_doc.png"
     test_img.parent.mkdir(parents=True, exist_ok=True)
     make_test_image(test_img)

@@ -150,6 +150,38 @@ def test_serve_file_resolves_date_folder(client):
     assert client.get(f"/files/{pid}/nope.txt", headers=client.h).status_code == 404
 
 
+def test_purge_old_files(tmp_path, monkeypatch):
+    import os
+    import service
+    jobs = tmp_path / "output"
+    monkeypatch.setattr(service, "JOBS_DIR", jobs)
+    now = time.time()
+    day = lambda ago: time.strftime("%Y-%m-%d", time.localtime(now - ago * 86400))
+
+    def job(parent, name, age_days=0):
+        d = parent / name
+        d.mkdir(parents=True)
+        (d / "input.png").write_bytes(b"x")
+        os.utime(d, (now - age_days * 86400,) * 2)
+        return d
+
+    old_day = job(jobs / day(40), "a").parent
+    new_day = job(jobs / day(2), "b").parent
+    old_flat = job(jobs, "legacy-old", age_days=40)
+    new_flat = job(jobs, "legacy-new", age_days=1)
+    not_a_job = jobs / "notes"
+    not_a_job.mkdir()
+    os.utime(not_a_job, (now - 400 * 86400,) * 2)
+
+    monkeypatch.setattr(service, "FILES_KEEP_DAYS", 0)          # off: nothing goes
+    assert service.purge_old_files(now) == 0 and old_day.exists()
+
+    monkeypatch.setattr(service, "FILES_KEEP_DAYS", 30)
+    assert service.purge_old_files(now) == 2
+    assert not old_day.exists() and not old_flat.exists()
+    assert new_day.exists() and new_flat.exists() and not_a_job.exists()
+
+
 def test_idempotent_duplicate(client):
     client.post("/api/ocr", headers=client.h, files={"file": _png()}, data={"key": "dup1"})
     r2 = client.post("/api/ocr", headers=client.h, files={"file": _png()}, data={"key": "dup1"})

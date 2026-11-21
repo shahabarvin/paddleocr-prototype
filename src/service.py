@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -37,13 +38,18 @@ from app import OCRService          # side-effect-free import of the reusable co
 from auth import auth_enabled, has_any_key, verify_bearer
 from store import Store
 
-BASE = Path(__file__).parent
-JOBS_DIR = BASE / "output"
-DB_PATH = Path(os.environ.get("OCR_DB", BASE / "state.db"))
+BASE = Path(__file__).resolve().parent          # src/ (code + openapi.yaml)
+ROOT = BASE.parent                              # repo root
+DATA = ROOT / "data"                            # machine-local state (git-ignored)
+DATA.mkdir(exist_ok=True)
+JOBS_DIR = ROOT / "output"
+DB_PATH = Path(os.environ.get("OCR_DB", DATA / "state.db"))
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf", ".bmp", ".webp"}
 SEATS = int(os.environ.get("OCR_SEATS", "3"))
 # How long finished rows (and their dedup/cache entry) live before purge.
 OCR_TTL_DAYS = float(os.environ.get("OCR_TTL_DAYS", "7"))
+# How long job files (output/<date>/<id>/) stay on disk. 0 = keep forever.
+FILES_KEEP_DAYS = float(os.environ.get("OCR_FILES_KEEP_DAYS", "0"))
 MAX_UPLOAD_BYTES = int(os.environ.get("OCR_MAX_UPLOAD_MB", "20")) * 1024 * 1024
 WORKER_ID = str(os.getpid())
 # Debug: write output/<process_id>/debug.json (input + output) per request.
@@ -95,6 +101,37 @@ def _warmup() -> None:
         _ready["error"] = str(err)
 
 
+_DAY_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_last_file_purge = [0.0]
+
+
+def purge_old_files(now: float | None = None) -> int:
+    """Delete job folders older than FILES_KEEP_DAYS; returns how many were
+    removed. Off when FILES_KEEP_DAYS is 0. A day folder (output/<date>/) goes
+    once that whole day is past the cutoff; an old-style output/<id>/ folder goes
+    by its modified time. Anything in output/ that is not a job folder is left."""
+    if FILES_KEEP_DAYS <= 0 or not JOBS_DIR.is_dir():
+        return 0
+    cutoff = (now or time.time()) - FILES_KEEP_DAYS * 86400
+    removed = 0
+    for d in JOBS_DIR.iterdir():
+        try:
+            if not d.is_dir():
+                continue
+            if _DAY_DIR.match(d.name):
+                day_end = datetime.datetime.strptime(d.name, "%Y-%m-%d").timestamp() + 86400
+                old = day_end < cutoff
+            else:
+                is_job = (d / "debug.json").exists() or any(d.glob("input.*"))
+                old = is_job and d.stat().st_mtime < cutoff
+            if old:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except (OSError, ValueError):
+            continue
+    return removed
+
+
 def _worker_loop() -> None:
     """Claim queued jobs and run them on this worker's pipeline, one at a time
     (the pipeline is single-threaded). Two such loops in two processes give the
@@ -116,6 +153,9 @@ def _worker_loop() -> None:
                 if ticks % 400 == 0:      # ~every 20s idle: free stuck seats + purge
                     store.reap_stale()
                     store.cleanup()
+                    if time.time() - _last_file_purge[0] > 3600:   # hourly
+                        _last_file_purge[0] = time.time()
+                        purge_old_files()
                 continue
             job = store.claim_next(WORKER_ID)
             if job is not None:
@@ -156,7 +196,7 @@ def _run(job: dict) -> None:
         result = service.process(
             input_path, viz_dir=viz_dir, tier=opt.get("tier", "server"),
             device=opt.get("device"), enhance=bool(opt.get("enhance")),
-            with_lines=bool(opt.get("with_lines")),
+            with_lines=True,     # always emit per-line text+box+score (+page_sizes)
         )
         result["timings"]["server_total_seconds"] = round(time.perf_counter() - t0, 3)
         result["process_id"] = pid
@@ -193,7 +233,6 @@ def submit(
     device: str = Form(""),
     enhance: str = Form("0"),
     overlays: str = Form("0"),
-    boxes: str = Form("0"),              # deprecated/no-op: lines are always returned now
 ) -> JSONResponse:
     # NOTE: no readiness gate here. This handler only enqueues the job into the
     # shared store; the OCR runs later in whichever worker's pull loop is ready.
@@ -237,7 +276,6 @@ def submit(
         "device": (device or None),
         "enhance": (enhance == "1"),
         "overlays": (overlays == "1"),
-        "with_lines": True,   # always emit per-line text+box+score (+page_sizes)
         "input_path": str(input_path),
         "key": key.strip() or None,
         "filename": file.filename,
@@ -553,7 +591,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
   // Per-row "box": rebuild a saved record's overlay from disk (input image +
   // debug.json lines), so it survives refreshes and never depends on the
-  // quick-test render still being on screen. Needs the job to have run boxes=1.
+  // quick-test render still being on screen.
   function closeBoxes() {
     document.getElementById('boxmodal').style.display = 'none';
     document.getElementById('bm_body').innerHTML = '';
@@ -660,7 +698,6 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     var fd = new FormData();
     fd.append('file', file);
     fd.append('key', key);
-    if (wantBoxes) fd.append('boxes', '1');         // opt-in only; never sent by Laravel
     document.getElementById('boxview').innerHTML = '';
     sendBtn.disabled = true; fOut.textContent = 'uploading...';
     fetch('/api/ocr', { method: 'POST', headers: { Authorization: 'Bearer ' + keyEl.value }, body: fd })

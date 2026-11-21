@@ -9,11 +9,11 @@
   for a read-only diagnostic that installs nothing.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File .\setup.ps1            # full setup
-  powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Warm      # + download/warm models
-  powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Check     # doctor only
-  powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Cpu       # CPU-only (skip GPU wheel)
-  powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Cuda cu126
+  powershell -ExecutionPolicy Bypass -File .\setup\setup.ps1            # full setup
+  powershell -ExecutionPolicy Bypass -File .\setup\setup.ps1 -Warm      # + download/warm models
+  powershell -ExecutionPolicy Bypass -File .\setup\setup.ps1 -Check     # doctor only
+  powershell -ExecutionPolicy Bypass -File .\setup\setup.ps1 -Cpu       # CPU-only (skip GPU wheel)
+  powershell -ExecutionPolicy Bypass -File .\setup\setup.ps1 -Cuda cu126
 #>
 param(
   [switch]$Check,
@@ -25,7 +25,8 @@ param(
 # with 'Stop' PowerShell 5.1 would abort on those, so we run in 'Continue' and
 # check exit codes explicitly for the steps that matter.
 $ErrorActionPreference = "Continue"
-$proj = $PSScriptRoot
+$proj = Split-Path $PSScriptRoot -Parent   # repo root (this file lives in setup\)
+Set-Location $proj
 $venv = Join-Path $proj ".venv"
 $py   = Join-Path $venv "Scripts\python.exe"
 
@@ -70,22 +71,22 @@ function Doctor {
   if ((Test-Path $models) -and (Get-ChildItem $models -ErrorAction SilentlyContinue)) { Ok "models cached in $models" }
   else { Warn "models not downloaded yet (first run / -Warm downloads ~1-2 GB)" }
 
-  $keys = Join-Path $proj "api_keys.json"
+  $keys = Join-Path $proj "data\api_keys.json"
   if (Test-Path $keys) {
     $active = PyOut "import json;print(sum(1 for k in json.load(open(r'$keys',encoding='utf-8'))['keys'] if k.get('active')))"
-    if ([int]$active -gt 0) { Ok "$active active API key(s)" } else { Warn "no ACTIVE API key -> .venv\Scripts\python keys.py create label" }
-  } else { Warn "no api_keys.json -> auth ON but every request is 401 until: .venv\Scripts\python keys.py create label" }
+    if ([int]$active -gt 0) { Ok "$active active API key(s)" } else { Warn "no ACTIVE API key -> .venv\Scripts\python src\keys.py create label" }
+  } else { Warn "no api_keys.json -> auth ON but every request is 401 until: .venv\Scripts\python src\keys.py create label" }
 
   if (Find-Cloudflared) { Ok "cloudflared installed" } else { Warn "cloudflared not installed (needed only for the public tunnel)" }
 
   $tasks = @(Get-ScheduledTask -TaskName "OCR-Server","Cloudflare-Tunnel" -ErrorAction SilentlyContinue)
   if ($tasks.Count -eq 2) { Ok "autostart tasks registered (OCR-Server, Cloudflare-Tunnel)" }
-  else { Warn "autostart not set up -> run install_autostart.ps1 as Admin" }
+  else { Warn "autostart not set up -> run setup\install_autostart.ps1 as Admin" }
 
   try {
     $h = Invoke-WebRequest "http://127.0.0.1:8000/healthz" -UseBasicParsing -TimeoutSec 3
     Ok "service UP on 127.0.0.1:8000 ($($h.Content))"
-  } catch { Warn "service not running on :8000 -> .venv\Scripts\python serve.py (or reboot for autostart)" }
+  } catch { Warn "service not running on :8000 -> .venv\Scripts\python src\serve.py (or reboot for autostart)" }
 
   Info "`n== $(if($issues){"$issues blocking issue(s)"}else{'all good'}) =="
   return $issues
@@ -127,9 +128,9 @@ if ($Cpu -or -not $hasGpu) {
 
 if ($Warm) {
   Info "Warming models (first time downloads ~1-2 GB)..."
-  & $py -c "from app import OCRService; s=OCRService(); print('  load', s.load('server'), 's on', s.default_device)"
+  & $py -c "import sys; sys.path.insert(0, 'src'); from app import OCRService; s=OCRService(); print('  load', s.load('server'), 's on', s.default_device)"
 }
 
 $rc = Doctor
-Info "`nNext:  .venv\Scripts\python keys.py create laravel-prod   then   .venv\Scripts\python serve.py"
+Info "`nNext:  .venv\Scripts\python src\keys.py create laravel-prod   then   .venv\Scripts\python src\serve.py"
 exit $rc

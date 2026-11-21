@@ -1,4 +1,5 @@
-"""End-to-end test of the seat-based multi-worker OCR service."""
+"""End-to-end test of the seat-based multi-worker OCR service.
+Run from the repo root: python tools/test_e2e.py (needs samples/receipt.png)."""
 import concurrent.futures
 import os
 import sys

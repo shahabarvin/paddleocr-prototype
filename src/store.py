@@ -256,7 +256,7 @@ class Store:
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(max(1, min(int(limit), 2000)))
         # has_boxes: 1 only when the stored result actually carries a per-line
-        # `lines` array (job ran with boxes=1), so the dashboard can enable/disable
+        # `lines` array (older records have none), so the dashboard can enable/disable
         # the "box" button without shipping the result payload.
         rows = self._conn().execute(
             "SELECT process_id, status, worker, error, created_at, claimed_at, "
